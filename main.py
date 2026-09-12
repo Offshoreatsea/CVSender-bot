@@ -16,6 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -34,7 +35,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "cvsenderforsea")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "cvsenderseaman")
+# Баннер, который прикрепляется отдельным фото-сообщением перед текстом каждой
+# опубликованной в канал вакансии (путь относительно корня проекта)
+CHANNEL_BANNER_PATH = os.path.join(os.path.dirname(__file__), "static", "assets", "channel_banner.jpg")
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
@@ -638,6 +642,14 @@ async def do_publish(bot: Bot, vacancy_id: int):
     row = db.get_vacancy(vacancy_id)
     fields = dict(row)
     text = render_template(fields)
+
+    # Баннер отправляется отдельным сообщением перед текстом вакансии — caption
+    # у фото в Telegram ограничен 1024 символами, а текст вакансии часто длиннее,
+    # поэтому не пытаемся уместить его в подпись к картинке.
+    try:
+        await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile(CHANNEL_BANNER_PATH))
+    except (TelegramAPIError, FileNotFoundError) as e:
+        print(f"[do_publish] Не удалось отправить баннер (публикуем текст без него): {e}")
 
     sent = await bot.send_message(
         chat_id=CHANNEL_ID, text=text,
