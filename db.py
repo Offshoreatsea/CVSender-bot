@@ -634,6 +634,16 @@ def get_subscriber_positions(tg_id: int) -> list[str]:
     return [r["position_tag"] for r in rows]
 
 
+def clear_subscriber_positions(tg_id: int):
+    """Полностью снимает все текущие должности подписчика — используется
+    админской командой /setposition для ручной смены выбора в обход
+    обычной блокировки."""
+    conn = get_conn()
+    conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
+
+
 def subscriber_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]

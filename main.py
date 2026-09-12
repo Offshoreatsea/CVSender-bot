@@ -50,7 +50,11 @@ STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отде
 PORT = int(os.getenv("PORT", "8080"))
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
 SUBSCRIPTION_DAYS = 30
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
+# Сколько дней вакансий отдаём новому подписчику при первом выборе должности —
+# не всю историю канала, а недавнее окно, чтобы не сливать сразу всю базу
+# бесплатно при первой же подписке
+BACKFILL_DAYS = 5
 REFERRAL_BONUS_DAYS = 3
 TRIAL_DAYS = 3
 EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # ориентир: ~$5
@@ -62,27 +66,39 @@ DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 # должность, которой тут нет, — просто допишите строку в список, ничего
 # больше менять не нужно.
 RANK_TAGS = [
-    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet",
-    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "EngineCadet",
-    "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter",
-    "Cook", "Steward", "Campboss", "ChiefSteward",
-    "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Welder", "Scaffolder",
-    "ClientRepresentative", "SafetyOfficer", "Surveyor",
+    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer", "DeckCadet",
+    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "JuniorEngineer", "EngineCadet",
+    "ETO", "Electrician", "RefEngineer", "GasEngineer",
+    "Bosun", "AB", "OS", "Roustabout", "Motorman", "Oiler", "Wiper", "Fitter", "Welder",
+    "Cook", "NightCook", "Steward", "Campboss", "ChiefSteward", "Messman", "Baker",
+    "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Scaffolder",
+    "ClientRepresentative", "SafetyOfficer", "Surveyor", "SurveyEngineer", "OnlineSurvey",
+    "Diver", "WinchOperator", "GangwayOperator", "HLO",
+    "MasterSDPO", "ChiefOfficerDPO", "SecondOfficerDPO", "ThirdOfficerJDPO",
 ]
 
 # Группировка тегов по департаментам — чисто вопрос навигации в /subscribe,
 # на матчинг вакансий и хранение подписок не влияет (там как был, так и
-# остался плоский position_tag). Допишите сюда любую новую должность из
-# RANK_TAGS в подходящий департамент, иначе она не попадёт ни в один экран.
+# остался плоский position_tag). Названия департаментов включают префикс
+# флота (Merchant / Offshore), чтобы разделить экраны выбора без отдельного
+# уровня "выбери флот" — это просто более длинный список кнопок.
 DEPARTMENTS = {
-    "Bridge": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet"],
-    "Engine": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer",
-               "EngineCadet", "ETO", "Electrician"],
-    "Ratings": ["Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter"],
-    "Catering": ["Cook", "Steward", "Campboss", "ChiefSteward"],
-    "Offshore & Specialist": ["CraneOperator", "DPOperator", "ROVPilot", "Rigger",
-                              "Welder", "Scaffolder", "ClientRepresentative",
-                              "SafetyOfficer", "Surveyor"],
+    "⚓ Merchant · Bridge Officers": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer"],
+    "⚓ Merchant · Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
+                                      "ETO", "Electrician", "RefEngineer", "GasEngineer"],
+    "⚓ Merchant · Deck Ratings": ["Bosun", "AB", "OS", "Fitter", "Welder", "DeckCadet"],
+    "⚓ Merchant · Engine Ratings": ["Oiler", "Wiper", "Motorman", "Fitter", "Welder", "EngineCadet"],
+    "⚓ Merchant · Catering": ["Cook", "NightCook", "Steward", "Messman", "Baker"],
+    "🛠 Offshore · Bridge Officers": ["MasterSDPO", "ChiefOfficerDPO", "SecondOfficerDPO",
+                                      "ThirdOfficerJDPO", "SafetyOfficer", "HLO"],
+    "🛠 Offshore · Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer",
+                                      "JuniorEngineer", "ETO", "Electrician"],
+    "🛠 Offshore · Deck Ratings": ["Bosun", "AB", "OS", "Roustabout", "CraneOperator",
+                                   "GangwayOperator", "HLO", "Rigger", "Fitter", "Welder", "DeckCadet"],
+    "🛠 Offshore · Engine Ratings": ["Oiler", "Wiper", "Motorman", "Fitter", "Welder", "EngineCadet"],
+    "🛠 Offshore · Catering": ["Cook", "NightCook", "Campboss", "Steward", "ChiefSteward", "Messman", "Baker"],
+    "🛠 Offshore · Survey & Other": ["ROVPilot", "ClientRepresentative", "OnlineSurvey",
+                                     "SurveyEngineer", "Diver", "Scaffolder", "WinchOperator"],
 }
 
 # Фиксированный список типов судов — тоже единый источник правды для тегов
@@ -111,6 +127,7 @@ TR = {
                             "the last 7 days for each, then new ones as they're posted:",
         "subscribed": "✅ Added {tag}. Sending recent vacancies...",
         "unsubscribed": "Removed {tag} from your alerts.",
+        "already_locked_tag": "This position is already locked in for this period. To change it, contact the admin.",
         "backfill_empty": "No {tag} vacancies in the last 7 days yet — "
                            "you'll get the next one as soon as it's posted.",
         "done": "✅ Done",
@@ -118,20 +135,20 @@ TR = {
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
-        "pay_intro": "Your free trial has ended. {price} Stars gets you 30 more days "
-                     "of instant notifications for the positions you choose.",
+        "pay_intro": "Your free trial has ended. Subscribe by card for instant "
+                     "notifications for the positions you choose.",
         "pay_button": "⭐ Pay {price} Stars for 30 days",
-        "pay_button_card": "💳 Pay by card",
-        "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
+        "pay_button_card": "💳 Subscribe by card",
+        "pay_contact_admin": "💬 Message admin",
         "trial_started": "🎉 You get {days} days free — no card needed. Choose your positions:",
         "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
         "invite_friend": "🎁 Invite a friend, get 3 free days",
         "referral_share_text": "Get job alerts by position on CV Sender 👇",
-        "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
+        "expiry_reminder": "⏳ Your subscription renews in a few days — €10 will be charged automatically to keep your job alerts active. Want to cancel instead?",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
-        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
+        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
-        "digest_menu_button": "📧 Get weekly email digest",
+        "digest_menu_button": "📧 Get weekly email list",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
@@ -157,6 +174,7 @@ TR = {
                             "за последние 7 дней по каждой, и дальше — все новые:",
         "subscribed": "✅ Добавлено: {tag}. Отправляю вакансии...",
         "unsubscribed": "Убрано из подписки: {tag}.",
+        "already_locked_tag": "Эта должность уже зафиксирована на этот период. Чтобы поменять — напишите админу.",
         "backfill_empty": "Вакансий по {tag} за последние 7 дней пока нет — "
                            "пришлю, как только появится подходящая.",
         "done": "✅ Готово",
@@ -164,20 +182,20 @@ TR = {
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
-        "pay_intro": "Ваш бесплатный период закончился. {price} ⭐ дают ещё 30 дней "
-                     "мгновенных уведомлений по выбранным должностям.",
+        "pay_intro": "Ваш бесплатный период закончился. Оформите подписку картой, "
+                     "чтобы получать мгновенные уведомления по выбранным должностям.",
         "pay_button": "⭐ Оплатить {price} Stars за 30 дней",
-        "pay_button_card": "💳 Оплатить картой",
-        "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
+        "pay_button_card": "💳 Оформить подписку картой",
+        "pay_contact_admin": "💬 Написать администратору",
         "trial_started": "🎉 Вам доступны {days} дня бесплатно — без карты. Выберите должности:",
         "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
         "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
         "referral_share_text": "Уведомления о вакансиях по должности в CV Sender 👇",
-        "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
+        "expiry_reminder": "⏳ Через несколько дней автоматически спишется 10 EUR за следующий период подписки. Если хотите отменить — напишите админу:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
-        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
+        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
-        "digest_menu_button": "📧 Получить email-дайджест за неделю",
+        "digest_menu_button": "📧 Получить подборку email за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
@@ -203,6 +221,7 @@ TR = {
                             "по кожній, а далі — всі нові:",
         "subscribed": "✅ Додано: {tag}. Надсилаю вакансії...",
         "unsubscribed": "Прибрано з підписки: {tag}.",
+        "already_locked_tag": "Ця посада вже зафіксована на цей період. Щоб змінити — напишіть адміну.",
         "backfill_empty": "Вакансій по {tag} за останні 7 днів поки немає — "
                            "надішлю, щойно з'явиться відповідна.",
         "done": "✅ Готово",
@@ -210,20 +229,20 @@ TR = {
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
-        "pay_intro": "Ваш безкоштовний період закінчився. {price} ⭐ дають ще 30 днів "
-                     "миттєвих сповіщень за обраними посадами.",
+        "pay_intro": "Ваш безкоштовний період закінчився. Оформіть підписку карткою, "
+                     "щоб отримувати миттєві сповіщення за обраними посадами.",
         "pay_button": "⭐ Оплатити {price} Stars за 30 днів",
-        "pay_button_card": "💳 Оплатити карткою",
-        "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
+        "pay_button_card": "💳 Оформити підписку карткою",
+        "pay_contact_admin": "💬 Напишіть адміністратору",
         "trial_started": "🎉 Вам доступні {days} дні безкоштовно — без картки. Оберіть посади:",
         "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
         "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
         "referral_share_text": "Сповіщення про вакансії за посадою в CV Sender 👇",
-        "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
+        "expiry_reminder": "⏳ Через кілька днів автоматично спишеться 10 EUR за наступний період підписки. Якщо хочете скасувати — напишіть адміну:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
-        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
+        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
-        "digest_menu_button": "📧 Отримати email-дайджест за тиждень",
+        "digest_menu_button": "📧 Отримати добірку email за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
@@ -564,11 +583,15 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="🎯 Get Matched Jobs", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
+        )],
+        [
+            InlineKeyboardButton(text="📄 Seamans Documents", url="https://t.me/cvsenderforsea"),
+            InlineKeyboardButton(text="✉️ CV Distribution", url="https://cv-sender.com"),
+        ],
+    ])
 
 
 
@@ -768,10 +791,7 @@ async def cmd_start(message: Message, command: CommandObject):
 
 
 def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
-        callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
-    )]]
+    rows = []
     if STRIPE_PAYMENT_LINK and tg_id:
         # client_reference_id — единственный способ Stripe сообщить вебхуком,
         # какому именно tg_id принадлежит платёж
@@ -841,10 +861,7 @@ async def cb_pay_subscription(callback: CallbackQuery):
 
 @router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
-        callback_data="pay_digest",
-    )]]
+    rows = []
     if STRIPE_DIGEST_PAYMENT_LINK and tg_id:
         # digest_ префикс в client_reference_id — так вебхук в webapp.py
         # отличает разовую покупку дайджеста от продления подписки
@@ -1405,6 +1422,49 @@ async def cmd_grant(message: Message, command: CommandObject):
         pass
 
 
+@router.message(Command("setposition"))
+async def cmd_setposition(message: Message, command: CommandObject):
+    """Ручная смена должности подписчика в обход обычной блокировки —
+    используется, когда человек ошибся при выборе или хочет сменить
+    направление посреди оплаченного периода. Пример:
+    /setposition @ivan Master,ChiefOfficer"""
+    if not admin_only(message.from_user.id):
+        return
+    args = (command.args or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "Использование: /setposition [@username или id] [должность1,должность2,...]\n"
+            "Названия должностей — как в RANK_TAGS, например: Master,ChiefOfficer"
+        )
+        return
+    handle, tags_raw = args
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе.")
+        return
+    tags = [tag.strip() for tag in tags_raw.split(",") if tag.strip()]
+    unknown = [tag for tag in tags if tag not in RANK_TAGS]
+    if unknown:
+        await message.answer(f"Неизвестные должности: {', '.join(unknown)}. Проверьте написание.")
+        return
+    if len(tags) > MAX_POSITIONS:
+        await message.answer(f"Максимум {MAX_POSITIONS} должности за раз.")
+        return
+    tg_id = row["tg_id"]
+    db.clear_subscriber_positions(tg_id)
+    for tag in tags:
+        db.toggle_subscription(tg_id, tag)
+    db.lock_positions(tg_id)
+    await message.answer(f"✅ Установил {handle}: {', '.join(tags)}.")
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await message.bot.send_message(
+            tg_id, f"Ваши должности были изменены администратором: {', '.join(tags)}."
+        )
+    except TelegramAPIError:
+        pass
+
+
 @router.message(Command("revoke"))
 async def cmd_revoke(message: Message, command: CommandObject):
     if not admin_only(message.from_user.id):
@@ -1531,7 +1591,14 @@ async def cb_subscribe_position(callback: CallbackQuery):
         return
 
     current = db.get_subscriber_positions(tg_id)
-    if position_tag not in current and len(current) >= MAX_POSITIONS:
+    if position_tag in current:
+        # уже выбрано — снятие запрещено намеренно: иначе человек может
+        # набирать вакансии по кругу (выбрал → получил бэкфилл → снял →
+        # выбрал другую), обходя лимит MAX_POSITIONS. Поменять выбор можно
+        # только через админа командой /setposition.
+        await callback.answer(t(lang, "already_locked_tag"), show_alert=True)
+        return
+    if len(current) >= MAX_POSITIONS:
         await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS), show_alert=True)
         return
 
@@ -1546,12 +1613,8 @@ async def cb_subscribe_position(callback: CallbackQuery):
     except TelegramAPIError:
         pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
 
-    if not added:
-        await callback.answer(t(lang, "unsubscribed", tag=position_tag))
-        return
-
     await callback.answer(t(lang, "subscribed", tag=position_tag))
-    backfill = db.get_recent_published_by_tag(position_tag, days=7)
+    backfill = db.get_recent_published_by_tag(position_tag, days=BACKFILL_DAYS)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
@@ -1748,9 +1811,10 @@ async def digest_worker(bot: Bot):
 
 
 async def subscription_reminder_worker(bot: Bot):
-    # проверяем раз в час — часто чаще и не нужно, окно напоминания 24ч
+    # проверяем раз в час; окно напоминания — 3 дня, чтобы предупредить
+    # заранее о предстоящем списании за следующий период
     while True:
-        expiring = db.get_expiring_subscribers(within_hours=24)
+        expiring = db.get_expiring_subscribers(within_hours=72)
         for row in expiring:
             lang = row["language"]
             try:
