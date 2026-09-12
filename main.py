@@ -20,6 +20,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
+    LinkPreviewOptions,
     MenuButtonWebApp,
     Message,
     PreCheckoutQuery,
@@ -39,6 +40,11 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "cvsenderseaman")
 # Баннер, который прикрепляется отдельным фото-сообщением перед текстом каждой
 # опубликованной в канал вакансии (путь относительно корня проекта)
 CHANNEL_BANNER_PATH = os.path.join(os.path.dirname(__file__), "static", "assets", "channel_banner.jpg")
+# Отключаем автопревью для ссылки на канал в конце каждого поста — иначе
+# Telegram подтягивает описание канала и кнопку "ПЕРЕЙТИ В КАНАЛ" отдельным
+# большим блоком под текстом; нужна просто голая строка со ссылкой, как у
+# OffshoreAtSea.
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
@@ -558,6 +564,53 @@ def render_template(fields: dict) -> str:
     return "\n".join(cleaned)
 
 
+CAPTION_LIMIT = 1024  # жёсткий лимит Telegram на подпись к фото
+
+
+def render_caption(fields: dict) -> str:
+    """Версия вакансии для caption к баннеру в канале — всегда укладывается
+    в лимит Telegram (1024 симв.), чтобы фото и текст были ОДНИМ постом, как
+    у OffshoreAtSea. В личные рассылки подписчикам по-прежнему уходит полный
+    текст через render_template — сокращаем только сам пост в канале.
+    Сокращаем по убыванию важности: сначала убираем списки
+    Documents/Requirements целиком, затем ужимаем произвольный текст notes,
+    и только в крайнем случае режем всё жёстко по длине."""
+    text = render_template(fields)
+    if len(text) <= CAPTION_LIMIT:
+        return text
+
+    trimmed = dict(fields)
+    trimmed.pop("documents", None)
+    trimmed.pop("requirements", None)
+    text = render_template(trimmed)
+    if len(text) <= CAPTION_LIMIT:
+        return text
+
+    if trimmed.get("notes"):
+        # считаем, сколько места остаётся под notes, если убрать его целиком,
+        # и обрезаем notes по этому бюджету с многоточием
+        without_notes = dict(trimmed)
+        without_notes.pop("notes", None)
+        base_len = len(render_template(without_notes))
+        budget = CAPTION_LIMIT - base_len - len("ℹ️ ") - 1  # 1 символ на "…"
+        notes = trimmed["notes"]
+        if budget > 20:
+            trimmed["notes"] = notes[:budget].rstrip() + "…"
+        else:
+            trimmed.pop("notes", None)
+        text = render_template(trimmed)
+        if len(text) <= CAPTION_LIMIT:
+            return text
+
+    # крайний случай — жёстко обрезаем, но сохраняем последнюю строку
+    # (ссылку на канал), чтобы пост не обрывался совсем без контекста
+    lines = text.split("\n")
+    footer = lines[-1]
+    head = "\n".join(lines[:-1])
+    budget = CAPTION_LIMIT - len(footer) - 2  # 2 символа на "…\n"
+    return head[:budget].rstrip() + "…\n" + footer
+
+
 def dedup_key_for(fields: dict) -> str:
     position = (fields.get("position") or "").strip().lower()
     contact = (fields.get("contact") or "").strip().lower()
@@ -664,20 +717,31 @@ def next_digest_slot() -> datetime:
 async def do_publish(bot: Bot, vacancy_id: int):
     row = db.get_vacancy(vacancy_id)
     fields = dict(row)
-    text = render_template(fields)
+    text = render_template(fields)  # полный текст — идёт в личные рассылки подписчикам
 
-    # Баннер отправляется отдельным сообщением перед текстом вакансии — caption
-    # у фото в Telegram ограничен 1024 символами, а текст вакансии часто длиннее,
-    # поэтому не пытаемся уместить его в подпись к картинке.
-    try:
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile(CHANNEL_BANNER_PATH))
-    except (TelegramAPIError, FileNotFoundError) as e:
-        print(f"[do_publish] Не удалось отправить баннер (публикуем текст без него): {e}")
-
-    sent = await bot.send_message(
-        chat_id=CHANNEL_ID, text=text,
-        reply_markup=channel_keyboard(vacancy_id),
-    )
+    # В канал — всегда фото+подпись ОДНИМ постом, как у OffshoreAtSea.
+    # render_caption сама ужимает текст под лимит подписи (1024 симв.), если
+    # вакансия развёрнутая; полный текст при этом всё равно уходит
+    # подписчикам через notify_subscribers ниже.
+    caption = render_caption(fields)
+    if os.path.isfile(CHANNEL_BANNER_PATH):
+        try:
+            sent = await bot.send_photo(
+                chat_id=CHANNEL_ID, photo=FSInputFile(CHANNEL_BANNER_PATH),
+                caption=caption, reply_markup=channel_keyboard(vacancy_id),
+            )
+        except TelegramAPIError as e:
+            print(f"[do_publish] Не удалось опубликовать фото+подпись, публикую текстом: {e}")
+            sent = await bot.send_message(
+                chat_id=CHANNEL_ID, text=text, reply_markup=channel_keyboard(vacancy_id),
+                link_preview_options=NO_PREVIEW,
+            )
+    else:
+        sent = await bot.send_message(
+            chat_id=CHANNEL_ID, text=text,
+            reply_markup=channel_keyboard(vacancy_id),
+            link_preview_options=NO_PREVIEW,
+        )
     db.set_status(vacancy_id, "published", sent.message_id)
 
     # публикация в канал уже состоялась и подтверждена выше — рассылка
@@ -1321,22 +1385,22 @@ async def handle_vacancy_text(message: Message):
                 f"⚠️ Похоже, такая вакансия уже публиковалась "
                 f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}"
             )
-            await message.answer(warn, reply_markup=duplicate_keyboard(vacancy_id))
+            await message.answer(warn, reply_markup=duplicate_keyboard(vacancy_id), link_preview_options=NO_PREVIEW)
             continue
 
         if auto:
             try:
                 await do_publish(message.bot, vacancy_id)
-                await message.answer(text + "\n\n✅ Опубликовано автоматически")
+                await message.answer(text + "\n\n✅ Опубликовано автоматически", link_preview_options=NO_PREVIEW)
             except TelegramAPIError as e:
                 await message.answer(
                     f"❌ Не удалось опубликовать автоматически: {e}\n\n{text}",
-                    reply_markup=draft_keyboard(vacancy_id),
+                    reply_markup=draft_keyboard(vacancy_id), link_preview_options=NO_PREVIEW,
                 )
         else:
             await message.answer(
                 text + "\n\n<i>Опубликовать сейчас или поставить в очередь дайджеста?</i>",
-                reply_markup=draft_keyboard(vacancy_id),
+                reply_markup=draft_keyboard(vacancy_id), link_preview_options=NO_PREVIEW,
             )
     await status_msg.delete()
 
@@ -1624,6 +1688,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
             await callback.bot.send_message(
                 tg_id, render_template(fields),
                 reply_markup=channel_keyboard(row["id"]),
+                link_preview_options=NO_PREVIEW,
             )
             await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
         except TelegramAPIError:
@@ -1662,6 +1727,7 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
             await bot.send_message(
                 tg_id, render_template(fields),
                 reply_markup=channel_keyboard(vacancy_id),
+                link_preview_options=NO_PREVIEW,
             )
             await asyncio.sleep(0.1)
         except TelegramAPIError:
