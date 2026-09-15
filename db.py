@@ -361,27 +361,6 @@ def is_subscription_active(tg_id: int) -> bool:
     return datetime.fromisoformat(row["subscription_until"]) > datetime.now()
 
 
-def get_subscription_until(tg_id: int):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
-    ).fetchone()
-    conn.close()
-    return row["subscription_until"] if row else None
-
-
-def get_all_subscriber_ids_with_subscription():
-    """tg_id всех, у кого subscription_until хоть раз проставлялся (были на
-    триале или платили) — независимо от того, истекла подписка сейчас или
-    нет. Используется массовым продлением /extendall."""
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT tg_id FROM subscribers WHERE subscription_until IS NOT NULL"
-    ).fetchall()
-    conn.close()
-    return [r["tg_id"] for r in rows]
-
-
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная
@@ -653,6 +632,16 @@ def get_subscriber_positions(tg_id: int) -> list[str]:
     ).fetchall()
     conn.close()
     return [r["position_tag"] for r in rows]
+
+
+def clear_subscriber_positions(tg_id: int):
+    """Полностью снимает все текущие должности подписчика — используется
+    админской командой /setposition для ручной смены выбора в обход
+    обычной блокировки."""
+    conn = get_conn()
+    conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
 
 
 def subscriber_stats():
