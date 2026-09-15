@@ -811,6 +811,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "подписчику вручную (лимит 3, в обход обычной блокировки)\n"
             "/getemails — платная подборка email за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не картой\n"
+            "/extendall [дней] — продлить доступ ВСЕМ подписчикам бесплатно (например, /extendall 4)\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход за период (по умолчанию 7 дней)\n"
@@ -1486,6 +1487,46 @@ async def cmd_grant(message: Message, command: CommandObject):
         )
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("extendall"))
+async def cmd_extend_all(message: Message, command: CommandObject):
+    """Массово продлевает доступ ВСЕМ подписчикам бота на N дней бесплатно —
+    например, в качестве акции или извинения за простой. Пример: /extendall 4"""
+    if not admin_only(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    if not args.isdigit():
+        await message.answer("Использование: /extendall [количество дней], например /extendall 4")
+        return
+    days = int(args)
+    people = db.get_subscribers_list()
+    if not people:
+        await message.answer("Подписчиков пока нет.")
+        return
+    status_msg = await message.answer(f"⏳ Продлеваю доступ {len(people)} подписчикам на {days} дней...")
+    notified = 0
+    for p in people:
+        tg_id = p["tg_id"]
+        new_until = db.extend_subscription(tg_id, days)
+        until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
+        lang = db.get_subscriber_language(tg_id)
+        try:
+            if lang == "en":
+                extend_text = f"🎁 We've extended your access by {days} free days. Active until {until_str}."
+            elif lang == "uk":
+                extend_text = f"🎁 Вам продовжили доступ на {days} днів безкоштовно. Активно до {until_str}."
+            else:
+                extend_text = f"🎁 Вам продлили доступ на {days} дней бесплатно. Активно до {until_str}."
+            await message.bot.send_message(tg_id, extend_text)
+            notified += 1
+            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
+        except TelegramAPIError:
+            pass
+    await status_msg.edit_text(
+        f"✅ Продлил доступ {len(people)} подписчикам на {days} дней "
+        f"(уведомление доставлено {notified} из {len(people)})."
+    )
 
 
 @router.message(Command("setposition"))
