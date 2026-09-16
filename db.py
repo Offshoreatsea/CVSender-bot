@@ -106,6 +106,12 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN referred_by INTEGER")
     if "reminder_sent_for" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
+    if "stripe_customer_id" not in sub_cols:
+        # нужен, чтобы: 1) автоматически продлевать доступ при ежемесячном
+        # списании Stripe (webhook invoice.payment_succeeded не содержит
+        # tg_id напрямую — только customer_id), и 2) генерировать ссылку на
+        # Customer Portal для самостоятельной отмены подписки
+        conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -382,6 +388,42 @@ def extend_subscription(tg_id: int, days: int):
     conn.commit()
     conn.close()
     return new_until
+
+
+def set_stripe_customer_id(tg_id: int, customer_id: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET stripe_customer_id = ? WHERE tg_id = ?", (customer_id, tg_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_tg_id_by_stripe_customer(customer_id: str) -> int | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT tg_id FROM subscribers WHERE stripe_customer_id = ?", (customer_id,)
+    ).fetchone()
+    conn.close()
+    return row["tg_id"] if row else None
+
+
+def get_stripe_customer_id(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT stripe_customer_id FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["stripe_customer_id"] if row else None
+
+
+def get_subscription_until(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["subscription_until"] if row else None
 
 
 def start_trial_if_new(tg_id: int, days: int) -> bool:
