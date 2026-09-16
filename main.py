@@ -740,7 +740,7 @@ def apply_button_url(vacancy_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
 
 
-def channel_keyboard(vacancy_id: int, is_tanker: bool = False) -> InlineKeyboardMarkup:
+def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
             text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
@@ -755,8 +755,13 @@ def channel_keyboard(vacancy_id: int, is_tanker: bool = False) -> InlineKeyboard
         # танкерных вакансий (сейчас указывает туда же, куда и обычный
         # канал, пока не завели отдельный — см. TANKER_CHANNEL_USERNAME)
         rows.append([InlineKeyboardButton(text="🛢 Канал танкерных вакансий", url=TANKER_CHANNEL_LINK)])
-    rows.append([InlineKeyboardButton(text="📋 Main Menu / Manage Subscription",
-                                       url=f"https://t.me/{BOT_USERNAME}?start=menu")])
+    if include_menu:
+        # эта кнопка — только для личных сообщений бота подписчику (backfill,
+        # уведомления о новой вакансии). В САМОМ канале её не показываем —
+        # там её видят вообще все читатели канала, а не только те, кто уже
+        # общается с ботом, так что "Manage Subscription" там неуместна
+        rows.append([InlineKeyboardButton(text="📋 Main Menu / Manage Subscription",
+                                           url=f"https://t.me/{BOT_USERNAME}?start=menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -832,7 +837,7 @@ async def _publish_to_channel(bot: Bot, chat_id: str, text: str, caption: str,
     """Публикует один пост (фото+подпись, либо просто текст, если баннера
     нет/не открылся) в указанный канал. Общая логика для основного канала и
     для канала танкерных вакансий — чтобы не дублировать try/except дважды."""
-    keyboard = channel_keyboard(vacancy_id, is_tanker=is_tanker)
+    keyboard = channel_keyboard(vacancy_id, is_tanker=is_tanker, include_menu=False)
     if os.path.isfile(CHANNEL_BANNER_PATH):
         try:
             sent = await bot.send_photo(
