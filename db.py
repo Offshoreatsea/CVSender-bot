@@ -107,6 +107,10 @@ def init_db():
     if "reminder_sent_for" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
     if "stripe_customer_id" not in sub_cols:
+        # нужен, чтобы: 1) автоматически продлевать доступ при ежемесячном
+        # списании Stripe (webhook invoice.payment_succeeded не содержит
+        # tg_id напрямую — только customer_id), и 2) генерировать ссылку на
+        # Customer Portal для самостоятельной отмены подписки
         conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
 
     conn.execute("""
@@ -156,8 +160,6 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-
-    migrate_legacy_position_tags()
 
 
 def get_setting(key: str, default: str) -> str:
@@ -365,45 +367,6 @@ def is_subscription_active(tg_id: int) -> bool:
     return datetime.fromisoformat(row["subscription_until"]) > datetime.now()
 
 
-def get_subscription_until(tg_id: int):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
-    ).fetchone()
-    conn.close()
-    return row["subscription_until"] if row else None
-
-
-def get_all_subscriber_ids_with_subscription():
-    """tg_id всех, у кого subscription_until хоть раз проставлялся (были на
-    триале или платили) — независимо от того, истекла подписка сейчас или
-    нет. Используется массовым продлением /extendall."""
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT tg_id FROM subscribers WHERE subscription_until IS NOT NULL"
-    ).fetchall()
-    conn.close()
-    return [r["tg_id"] for r in rows]
-
-
-def set_stripe_customer_id(tg_id: int, customer_id: str):
-    conn = get_conn()
-    conn.execute(
-        "UPDATE subscribers SET stripe_customer_id = ? WHERE tg_id = ?", (customer_id, tg_id)
-    )
-    conn.commit()
-    conn.close()
-
-
-def find_tg_id_by_stripe_customer(customer_id: str):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT tg_id FROM subscribers WHERE stripe_customer_id = ?", (customer_id,)
-    ).fetchone()
-    conn.close()
-    return row["tg_id"] if row else None
-
-
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная
@@ -425,6 +388,42 @@ def extend_subscription(tg_id: int, days: int):
     conn.commit()
     conn.close()
     return new_until
+
+
+def set_stripe_customer_id(tg_id: int, customer_id: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET stripe_customer_id = ? WHERE tg_id = ?", (customer_id, tg_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_tg_id_by_stripe_customer(customer_id: str) -> int | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT tg_id FROM subscribers WHERE stripe_customer_id = ?", (customer_id,)
+    ).fetchone()
+    conn.close()
+    return row["tg_id"] if row else None
+
+
+def get_stripe_customer_id(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT stripe_customer_id FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["stripe_customer_id"] if row else None
+
+
+def get_subscription_until(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["subscription_until"] if row else None
 
 
 def start_trial_if_new(tg_id: int, days: int) -> bool:
@@ -677,6 +676,16 @@ def get_subscriber_positions(tg_id: int) -> list[str]:
     return [r["position_tag"] for r in rows]
 
 
+def clear_subscriber_positions(tg_id: int):
+    """Полностью снимает все текущие должности подписчика — используется
+    админской командой /setposition для ручной смены выбора в обход
+    обычной блокировки."""
+    conn = get_conn()
+    conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
+
+
 def subscriber_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
@@ -688,32 +697,42 @@ def subscriber_stats():
     return total, by_tag
 
 
-def get_subscribers_for_tag(position_tag: str):
+def get_subscribers_for_tag(position_tag: str | list[str]):
     # рассылка вакансий — платная фича: шлём только тем, у кого подписка
-    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность
+    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность.
+    # Принимает и один тег, и список — список нужен для обратной совместимости
+    # со старыми тегами, переименованными при переходе на разделение по
+    # флотам (см. LEGACY_TAG_ALIASES в main.py)
+    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
     conn = get_conn()
+    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        """SELECT subscriptions.tg_id FROM subscriptions
+        f"""SELECT DISTINCT subscriptions.tg_id FROM subscriptions
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
-           WHERE subscriptions.position_tag = ?
+           WHERE subscriptions.position_tag IN ({placeholders})
              AND subscribers.subscription_until IS NOT NULL
              AND subscribers.subscription_until > ?""",
-        (position_tag, datetime.now().isoformat()),
+        (*tags, datetime.now().isoformat()),
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
 
 
-def get_recent_published_by_tag(position_tag: str, days: int = 7):
+def get_recent_published_by_tag(position_tag: str | list[str], days: int = 7):
     """Бэкфилл для новых подписчиков — опубликованные вакансии этой должности
-    за последние `days` суток, от старых к новым."""
+    за последние `days` суток, от старых к новым. Принимает и один тег, и
+    список (для обратной совместимости со старыми тегами, см.
+    LEGACY_TAG_ALIASES в main.py — старые вакансии до переезда на флоты
+    хранят прежнее короткое название тега)."""
+    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
     conn = get_conn()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        """SELECT * FROM vacancies
-           WHERE status = 'published' AND position_tag = ? AND created_at > ?
+        f"""SELECT * FROM vacancies
+           WHERE status = 'published' AND position_tag IN ({placeholders}) AND created_at > ?
            ORDER BY created_at ASC""",
-        (position_tag, cutoff),
+        (*tags, cutoff),
     ).fetchall()
     conn.close()
     return rows
@@ -877,66 +896,3 @@ def list_contacts_since(days: int = 7):
     ).fetchall()
     conn.close()
     return [r["contact"] for r in rows]
-
-
-# Соответствие старых плоских тегов (до перехода на таксономию флот+
-# департамент) новым OFF_-тегам. Нужно, потому что новые вакансии теперь
-# публикуются только с новыми тегами, а у подписчиков, оформивших подписку
-# ДО этого перехода, в базе остались старые — без миграции рассылка для них
-# просто переставала совпадать и переставала работать.
-LEGACY_TAG_MIGRATION = {
-    "Master": "OFF_Master",
-    "ChiefOfficer": "OFF_ChiefOfficer",
-    "SecondOfficer": "OFF_SecondOfficer",
-    "ThirdOfficer": "OFF_ThirdOfficer",
-    "DeckCadet": "OFF_DeckCadet",
-    "ChiefEngineer": "OFF_ChiefEngineer",
-    "SecondEngineer": "OFF_SecondEngineer",
-    "ThirdEngineer": "OFF_ThirdEngineer",
-    "FourthEngineer": "OFF_JuniorEngineer",
-    "EngineCadet": "OFF_EngineCadet",
-    "ETO": "OFF_ETO",
-    "Electrician": "OFF_ETO",
-    "Bosun": "OFF_Bosun",
-    "AB": "OFF_AB",
-    "OS": "OFF_AB",
-    "Motorman": "OFF_Motorman",
-    "Oiler": "OFF_Oiler",
-    "Fitter": "OFF_FitterWelder",
-    "Cook": "OFF_Cook",
-    "Steward": "OFF_Steward",
-    "Campboss": "OFF_CampBoss",
-    "ChiefSteward": "OFF_ChiefSteward",
-    "CraneOperator": "OFF_CraneOperator",
-    "DPOperator": "OFF_SecondOfficer",  # приблизительно — DP-роль в новой таксономии размазана по офицерским рангам
-    "ROVPilot": "OFF_ROV",
-    "Rigger": "OFF_Rigger",
-    "Welder": "OFF_FitterWelder",
-    "Scaffolder": "OFF_Scaffolder",
-    "ClientRepresentative": "OFF_ClientRep",
-    "SafetyOfficer": "OFF_SafetyOfficer",
-    "Surveyor": "OFF_SurveyEngineer",
-}
-
-
-def migrate_legacy_position_tags():
-    """Переносит старые теги в subscriptions на новые — идемпотентно
-    (повторный запуск ничего не ломает, старых тегов после первого раза
-    уже не останется). Вызывается один раз при каждом старте бота."""
-    conn = get_conn()
-    migrated = 0
-    for old_tag, new_tag in LEGACY_TAG_MIGRATION.items():
-        # UPDATE OR IGNORE — если у человека почему-то уже есть и старый, и
-        # новый тег одновременно (маловероятно, но возможно после ручных
-        # правок), не ломаем UNIQUE-ограничение дублем, просто оставляем
-        # новый как есть и убираем старую строку отдельно
-        cur = conn.execute(
-            "UPDATE OR IGNORE subscriptions SET position_tag = ? WHERE position_tag = ?",
-            (new_tag, old_tag),
-        )
-        migrated += cur.rowcount
-        conn.execute("DELETE FROM subscriptions WHERE position_tag = ?", (old_tag,))
-    conn.commit()
-    conn.close()
-    if migrated:
-        print(f"[migrate_legacy_position_tags] Перенесено подписок на новую таксономию: {migrated}")
