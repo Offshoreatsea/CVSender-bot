@@ -697,32 +697,42 @@ def subscriber_stats():
     return total, by_tag
 
 
-def get_subscribers_for_tag(position_tag: str):
+def get_subscribers_for_tag(position_tag: str | list[str]):
     # рассылка вакансий — платная фича: шлём только тем, у кого подписка
-    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность
+    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность.
+    # Принимает и один тег, и список — список нужен для обратной совместимости
+    # со старыми тегами, переименованными при переходе на разделение по
+    # флотам (см. LEGACY_TAG_ALIASES в main.py)
+    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
     conn = get_conn()
+    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        """SELECT subscriptions.tg_id FROM subscriptions
+        f"""SELECT DISTINCT subscriptions.tg_id FROM subscriptions
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
-           WHERE subscriptions.position_tag = ?
+           WHERE subscriptions.position_tag IN ({placeholders})
              AND subscribers.subscription_until IS NOT NULL
              AND subscribers.subscription_until > ?""",
-        (position_tag, datetime.now().isoformat()),
+        (*tags, datetime.now().isoformat()),
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
 
 
-def get_recent_published_by_tag(position_tag: str, days: int = 7):
+def get_recent_published_by_tag(position_tag: str | list[str], days: int = 7):
     """Бэкфилл для новых подписчиков — опубликованные вакансии этой должности
-    за последние `days` суток, от старых к новым."""
+    за последние `days` суток, от старых к новым. Принимает и один тег, и
+    список (для обратной совместимости со старыми тегами, см.
+    LEGACY_TAG_ALIASES в main.py — старые вакансии до переезда на флоты
+    хранят прежнее короткое название тега)."""
+    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
     conn = get_conn()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        """SELECT * FROM vacancies
-           WHERE status = 'published' AND position_tag = ? AND created_at > ?
+        f"""SELECT * FROM vacancies
+           WHERE status = 'published' AND position_tag IN ({placeholders}) AND created_at > ?
            ORDER BY created_at ASC""",
-        (position_tag, cutoff),
+        (*tags, cutoff),
     ).fetchall()
     conn.close()
     return rows

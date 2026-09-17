@@ -168,6 +168,37 @@ TAG_TO_FLEET = {
 
 MAX_POSITIONS_PER_FLEET = 2
 
+# До разделения на 3 флота часть тегов Offshore-департаментов была БЕЗ
+# суффикса (например "ChiefEngineer" использовался и для Merchant, и для
+# Offshore). После переезда на изолированные теги ("ChiefEngineerOffshore")
+# у подписчиков, выбравших должность ДО этого перехода, в базе так и
+# остался старый короткий тег — а новые вакансии Claude размечает уже новым.
+# Чтобы такие подписчики не потеряли рассылку молча, при уведомлении о новой
+# офшорной вакансии дополнительно ищем и по старому тегу тоже.
+LEGACY_TAG_ALIASES = {
+    "ChiefEngineerOffshore": "ChiefEngineer",
+    "SecondEngineerOffshore": "SecondEngineer",
+    "ThirdEngineerOffshore": "ThirdEngineer",
+    "JuniorEngineerOffshore": "JuniorEngineer",
+    "ETOOffshore": "ETO",
+    "ElectricianOffshore": "Electrician",
+    "BosunOffshore": "Bosun",
+    "ABOffshore": "AB",
+    "OSOffshore": "OS",
+    "FitterOffshore": "Fitter",
+    "WelderOffshore": "Welder",
+    "DeckCadetOffshore": "DeckCadet",
+    "OilerOffshore": "Oiler",
+    "WiperOffshore": "Wiper",
+    "MotormanOffshore": "Motorman",
+    "EngineCadetOffshore": "EngineCadet",
+    "CookOffshore": "Cook",
+    "NightCookOffshore": "NightCook",
+    "StewardOffshore": "Steward",
+    "MessmanOffshore": "Messman",
+    "BakerOffshore": "Baker",
+}
+
 # Фиксированный список типов судов — тоже единый источник правды для тегов
 # и матчинга.
 VESSEL_TAGS = [
@@ -2024,7 +2055,14 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     if not position_tag or position_tag == FALLBACK_TAG:
         return
     is_tanker = TAG_TO_FLEET.get(position_tag) == "tanker"
-    for tg_id in db.get_subscribers_for_tag(position_tag):
+    # ищем и по новому тегу, и по старому (если он есть в таблице алиасов) —
+    # чтобы подписчики, выбравшие должность ещё до перехода на разделение по
+    # флотам, продолжали получать рассылку без необходимости пересоздавать
+    # подписку
+    tags_to_match = [position_tag]
+    if position_tag in LEGACY_TAG_ALIASES:
+        tags_to_match.append(LEGACY_TAG_ALIASES[position_tag])
+    for tg_id in db.get_subscribers_for_tag(tags_to_match):
         try:
             await bot.send_message(
                 tg_id, render_template(fields),
