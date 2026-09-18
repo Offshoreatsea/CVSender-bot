@@ -976,10 +976,14 @@ async def cmd_start(message: Message, command: CommandObject):
             "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
             "/setposition [@ник или id] [должность1,должность2] — сменить должности "
             "подписчику вручную (лимит 3, в обход обычной блокировки)\n"
+            "/unlockpositions [@ник или id] — разблокировать выбор, чтобы человек сам перевыбрал должности в /subscribe\n"
+            "/lockpositions [@ник или id] — зафиксировать текущий выбор обратно\n"
+            "/unlockpositionsall — разблокировать выбор должностей ВСЕМ подписчикам сразу\n"
             "/getemails — платная подборка email за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не картой\n"
             "/extendall [дней] — продлить доступ ВСЕМ подписчикам бесплатно (например, /extendall 4)\n"
             "/broadcast [текст] — отправить произвольное сообщение ВСЕМ подписчикам (с подтверждением перед отправкой)\n"
+            "/broadcastuser [@ник или id] [текст] — отправить сообщение ОДНОМУ подписчику (с подтверждением)\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход за период (по умолчанию 7 дней)\n"
@@ -1757,10 +1761,11 @@ async def cmd_extend_all(message: Message, command: CommandObject):
     )
 
 
-# храним текст рассылки в памяти по tg_id админа (не в callback_data — оно
-# ограничено 64 байтами, длинный текст туда не влезет), поэтому один админ
-# может держать только одну неподтверждённую рассылку одновременно
-_pending_broadcasts: dict[int, str] = {}
+# храним рассылку (кому + текст) в памяти по tg_id админа (не в callback_data —
+# оно ограничено 64 байтами, длинный текст туда не влезет). target=None
+# означает "всем подписчикам", иначе — конкретный tg_id. Один админ может
+# держать только одну неподтверждённую рассылку одновременно
+_pending_broadcasts: dict[int, tuple[int | None, str]] = {}
 
 
 @router.message(Command("broadcast"))
@@ -1775,18 +1780,46 @@ async def cmd_broadcast(message: Message, command: CommandObject):
     if not text:
         await message.answer(
             "Использование: /broadcast [текст сообщения]\n"
-            "Пример: /broadcast Добавили новый раздел Танкера! Загляните в /subscribe"
+            "Пример: /broadcast Добавили новый раздел Танкера! Загляните в /subscribe\n\n"
+            "Чтобы отправить одному человеку — /broadcastuser [@ник или id] [текст]"
         )
         return
     people = db.get_subscribers_list()
     if not people:
         await message.answer("Подписчиков пока нет.")
         return
-    _pending_broadcasts[message.from_user.id] = text
+    _pending_broadcasts[message.from_user.id] = (None, text)
     await message.answer(
         f"Превью сообщения для {len(people)} подписчиков:\n\n{text}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Отправить всем", callback_data="bcast_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
+        ]]),
+    )
+
+
+@router.message(Command("broadcastuser"))
+async def cmd_broadcast_user(message: Message, command: CommandObject):
+    """То же самое, что /broadcast, но одному конкретному подписчику —
+    например, чтобы лично ответить/уточнить что-то, не трогая всех
+    остальных. Пример: /broadcastuser @ivan Ваш платёж пришёл, всё ок!"""
+    if not admin_only(message.from_user.id):
+        return
+    args = (command.args or "").split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /broadcastuser [@username или id] [текст сообщения]")
+        return
+    handle, text = args
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе.")
+        return
+    tg_id = row["tg_id"]
+    _pending_broadcasts[message.from_user.id] = (tg_id, text)
+    await message.answer(
+        f"Превью сообщения для {handle}:\n\n{text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Отправить", callback_data="bcast_confirm"),
             InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
         ]]),
     )
@@ -1804,13 +1837,22 @@ async def cb_broadcast_confirm(callback: CallbackQuery):
     if not admin_only(callback.from_user.id):
         await callback.answer()
         return
-    text = _pending_broadcasts.pop(callback.from_user.id, None)
-    if not text:
+    pending = _pending_broadcasts.pop(callback.from_user.id, None)
+    if not pending:
         await callback.answer("Текст рассылки не найден — попробуйте /broadcast заново.", show_alert=True)
+        return
+    target, text = pending
+    await callback.answer()
+    if target is not None:
+        # одному конкретному человеку
+        try:
+            await callback.bot.send_message(target, text)
+            await callback.message.edit_text("✅ Отправлено.")
+        except TelegramAPIError as e:
+            await callback.message.edit_text(f"❌ Не удалось отправить: {e}")
         return
     people = db.get_subscribers_list()
     await callback.message.edit_text(f"⏳ Отправляю {len(people)} подписчикам...")
-    await callback.answer()
     sent = 0
     for p in people:
         try:
@@ -1903,6 +1945,90 @@ async def cmd_setposition(message: Message, command: CommandObject):
         )
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("unlockpositions"))
+async def cmd_unlock_positions(message: Message, command: CommandObject):
+    """Разблокирует выбор должностей конкретному подписчику — он сам заходит
+    в /subscribe и перевыбирает (в отличие от /setposition, где должности
+    назначает админ вручную). Текущий выбор при этом НЕ сбрасывается — просто
+    снимается блокировка, так что он может дозаполнить свободные слоты или
+    поменять что-то через обычный интерфейс. Пример: /unlockpositions @ivan"""
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /unlockpositions [@username или id]")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе.")
+        return
+    tg_id = row["tg_id"]
+    db.unlock_positions(tg_id)
+    await message.answer(f"🔓 Разблокировал выбор должностей для {handle}.")
+    lang = db.get_subscriber_language(tg_id)
+    try:
+        await message.bot.send_message(
+            tg_id,
+            "🔓 Администратор разблокировал вам выбор должностей — заходите в /subscribe, "
+            "чтобы изменить или дополнить выбор."
+        )
+    except TelegramAPIError:
+        pass
+
+
+@router.message(Command("lockpositions"))
+async def cmd_lock_positions(message: Message, command: CommandObject):
+    """Обратная команда — принудительно фиксирует текущий выбор должностей
+    подписчика (например, если /unlockpositions выдали по ошибке или хотят
+    зафиксировать выбор раньше следующей оплаты). Пример: /lockpositions @ivan"""
+    if not admin_only(message.from_user.id):
+        return
+    handle = (command.args or "").strip()
+    if not handle:
+        await message.answer("Использование: /lockpositions [@username или id]")
+        return
+    row = db.find_subscriber_by_handle(handle)
+    if not row:
+        await message.answer(f"Не нашёл {handle} в базе.")
+        return
+    tg_id = row["tg_id"]
+    db.lock_positions(tg_id)
+    await message.answer(f"🔒 Зафиксировал текущий выбор должностей для {handle}.")
+
+
+@router.message(Command("unlockpositionsall"))
+async def cmd_unlock_positions_all(message: Message, command: CommandObject):
+    """Массовая версия /unlockpositions — разблокирует выбор должностей
+    ВСЕМ подписчикам сразу (например, после большого обновления списка
+    должностей, чтобы все могли перевыбрать под новую структуру флотов).
+    Текущий выбор у каждого не сбрасывается, только снимается блокировка."""
+    if not admin_only(message.from_user.id):
+        return
+    people = db.get_subscribers_list()
+    if not people:
+        await message.answer("Подписчиков пока нет.")
+        return
+    status_msg = await message.answer(f"⏳ Разблокирую выбор должностей {len(people)} подписчикам...")
+    notified = 0
+    for p in people:
+        tg_id = p["tg_id"]
+        db.unlock_positions(tg_id)
+        try:
+            await message.bot.send_message(
+                tg_id,
+                "🔓 Администратор разблокировал вам выбор должностей — заходите в /subscribe, "
+                "чтобы изменить или дополнить выбор."
+            )
+            notified += 1
+            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
+        except TelegramAPIError:
+            pass
+    await status_msg.edit_text(
+        f"✅ Разблокировал выбор должностей {len(people)} подписчикам "
+        f"(уведомление доставлено {notified} из {len(people)})."
+    )
 
 
 @router.message(Command("revoke"))
