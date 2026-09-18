@@ -116,7 +116,7 @@ OFFSHORE_DEPARTMENTS = {
     "Engine Officers": ["ChiefEngineerOffshore", "SecondEngineerOffshore", "ThirdEngineerOffshore",
                         "JuniorEngineerOffshore", "ETOOffshore", "ElectricianOffshore"],
     "Deck Ratings": ["BosunOffshore", "ABOffshore", "OSOffshore", "Roustabout", "CraneOperator",
-                     "GangwayOperator", "Rigger", "FitterOffshore", "WelderOffshore", "DeckCadetOffshore"],
+                     "GangwayOperator", "HLO", "Rigger", "FitterOffshore", "WelderOffshore", "DeckCadetOffshore"],
     "Engine Ratings": ["OilerOffshore", "WiperOffshore", "MotormanOffshore",
                        "FitterOffshore", "WelderOffshore", "EngineCadetOffshore"],
     "Catering": ["CookOffshore", "NightCookOffshore", "Campboss", "StewardOffshore",
@@ -979,6 +979,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/getemails — платная подборка email за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не картой\n"
             "/extendall [дней] — продлить доступ ВСЕМ подписчикам бесплатно (например, /extendall 4)\n"
+            "/broadcast [текст] — отправить произвольное сообщение ВСЕМ подписчикам (с подтверждением перед отправкой)\n"
             "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
             "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
             "/revenue [дней] — доход за период (по умолчанию 7 дней)\n"
@@ -1756,6 +1757,103 @@ async def cmd_extend_all(message: Message, command: CommandObject):
     )
 
 
+# храним текст рассылки в памяти по tg_id админа (не в callback_data — оно
+# ограничено 64 байтами, длинный текст туда не влезет), поэтому один админ
+# может держать только одну неподтверждённую рассылку одновременно
+_pending_broadcasts: dict[int, str] = {}
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, command: CommandObject):
+    """Рассылка произвольного текста ВСЕМ подписчикам бота — для объявлений
+    об обновлениях, техработах и т.п. Перед реальной отправкой показывает
+    превью текста и просит подтвердить, чтобы опечатка не улетела мгновенно
+    всей базе. Пример: /broadcast Добавили раздел Танкера! Загляните в /subscribe"""
+    if not admin_only(message.from_user.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Использование: /broadcast [текст сообщения]\n"
+            "Пример: /broadcast Добавили новый раздел Танкера! Загляните в /subscribe"
+        )
+        return
+    people = db.get_subscribers_list()
+    if not people:
+        await message.answer("Подписчиков пока нет.")
+        return
+    _pending_broadcasts[message.from_user.id] = text
+    await message.answer(
+        f"Превью сообщения для {len(people)} подписчиков:\n\n{text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Отправить всем", callback_data="bcast_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
+        ]]),
+    )
+
+
+@router.callback_query(F.data == "bcast_cancel")
+async def cb_broadcast_cancel(callback: CallbackQuery):
+    _pending_broadcasts.pop(callback.from_user.id, None)
+    await callback.message.edit_text("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bcast_confirm")
+async def cb_broadcast_confirm(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer()
+        return
+    text = _pending_broadcasts.pop(callback.from_user.id, None)
+    if not text:
+        await callback.answer("Текст рассылки не найден — попробуйте /broadcast заново.", show_alert=True)
+        return
+    people = db.get_subscribers_list()
+    await callback.message.edit_text(f"⏳ Отправляю {len(people)} подписчикам...")
+    await callback.answer()
+    sent = 0
+    for p in people:
+        try:
+            await callback.bot.send_message(p["tg_id"], text)
+            sent += 1
+            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
+        except TelegramAPIError:
+            pass
+    await callback.message.edit_text(f"✅ Отправлено {sent} из {len(people)} подписчиков.")
+
+
+@router.message(Command("testnotify"))
+async def cmd_test_notify(message: Message, command: CommandObject):
+    """Диагностика рассылки: показывает, сколько активных подписчиков будет
+    найдено для данного тега (и его legacy-алиаса, если есть), без реальной
+    отправки сообщений. Помогает быстро понять — тег не совпадает, подписка
+    истекла, или подписчиков просто нет. Пример: /testnotify ChiefEngineerOffshore"""
+    if not admin_only(message.from_user.id):
+        return
+    tag = (command.args or "").strip()
+    if not tag:
+        await message.answer("Использование: /testnotify [тег должности], например /testnotify Master")
+        return
+    if tag not in RANK_TAGS:
+        await message.answer(f"⚠️ Тег «{tag}» не найден в текущем RANK_TAGS (проверьте написание).")
+        return
+    fleet = TAG_TO_FLEET.get(tag, "неизвестен")
+    alias = LEGACY_TAG_ALIASES.get(tag)
+    tags_to_match = [tag] + ([alias] if alias else [])
+    matched = db.get_subscribers_for_tag(tags_to_match)
+    lines = [
+        f"Тег: {tag} (флот: {fleet})",
+        f"Legacy-алиас: {alias or '—'}",
+        f"Искали по тегам: {', '.join(tags_to_match)}",
+        f"Найдено активных подписчиков: {len(matched)}",
+    ]
+    if matched:
+        lines.append("tg_id: " + ", ".join(str(x) for x in matched[:30]))
+        if len(matched) > 30:
+            lines.append(f"...и ещё {len(matched) - 30}")
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("setposition"))
 async def cmd_setposition(message: Message, command: CommandObject):
     """Ручная смена должности подписчика в обход обычной блокировки —
@@ -2062,7 +2160,10 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     tags_to_match = [position_tag]
     if position_tag in LEGACY_TAG_ALIASES:
         tags_to_match.append(LEGACY_TAG_ALIASES[position_tag])
-    for tg_id in db.get_subscribers_for_tag(tags_to_match):
+    subscriber_ids = db.get_subscribers_for_tag(tags_to_match)
+    print(f"[notify_subscribers] vacancy_id={vacancy_id} tag={position_tag} "
+          f"tags_to_match={tags_to_match} найдено подписчиков: {len(subscriber_ids)}")
+    for tg_id in subscriber_ids:
         try:
             await bot.send_message(
                 tg_id, render_template(fields),
