@@ -150,6 +150,15 @@ def init_db():
             "INSERT OR IGNORE INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
             (row["tg_id"], row["position_tag"], datetime.now().isoformat()),
         )
+    sub_cols = [r["name"] for r in conn.execute("PRAGMA table_info(subscriptions)")]
+    if "active" not in sub_cols:
+        # снятие должности больше не удаляет строку целиком — иначе теряется
+        # история "уже получал бэкфилл по этой должности", и человек мог бы
+        # выкачивать вакансии по кругу (снял → выбрал снова → получил
+        # бэкфилл заново). Активные подписки — active=1
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN active INTEGER DEFAULT 1")
+    if "backfill_sent" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN backfill_sent INTEGER DEFAULT 0")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS click_events (
@@ -630,7 +639,7 @@ def get_subscribers_list():
     result = []
     for s in subs:
         positions = conn.execute(
-            "SELECT position_tag FROM subscriptions WHERE tg_id = ?", (s["tg_id"],)
+            "SELECT position_tag FROM subscriptions WHERE tg_id = ? AND active = 1", (s["tg_id"],)
         ).fetchall()
         result.append({
             "tg_id": s["tg_id"],
@@ -643,34 +652,47 @@ def get_subscribers_list():
     return result
 
 
-def toggle_subscription(tg_id: int, position_tag: str) -> bool:
-    """Переключает подписку на должность (добавляет, если не было — убирает,
-    если уже была). Возвращает True, если после вызова подписка ДОБАВЛЕНА
-    (значит нужно прислать бэкфилл), False — если снята."""
+def toggle_subscription(tg_id: int, position_tag: str) -> tuple[bool, bool]:
+    """Переключает подписку на должность (активирует, если выключена/не было —
+    выключает, если уже активна). В отличие от старой версии, строка не
+    удаляется при снятии — сохраняем историю, чтобы не слать бэкфилл повторно
+    при повторном включении той же должности (иначе можно снять-выбрать по
+    кругу и выкачать вакансии бесконечно).
+    Возвращает (is_active, should_send_backfill):
+      is_active — включена ли должность СЕЙЧАС, после этого вызова
+      should_send_backfill — нужно ли прислать бэкфилл (True только когда
+      должность включена и бэкфилл по ней ещё ни разу не отправлялся)"""
     conn = get_conn()
     existing = conn.execute(
-        "SELECT 1 FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
+        "SELECT active, backfill_sent FROM subscriptions WHERE tg_id = ? AND position_tag = ?",
+        (tg_id, position_tag),
     ).fetchone()
-    if existing:
+    if existing is None:
         conn.execute(
-            "DELETE FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
-        )
-        added = False
-    else:
-        conn.execute(
-            "INSERT INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
+            "INSERT INTO subscriptions (tg_id, position_tag, subscribed_at, active, backfill_sent) "
+            "VALUES (?, ?, ?, 1, 1)",
             (tg_id, position_tag, datetime.now().isoformat()),
         )
-        added = True
+        conn.commit()
+        conn.close()
+        return True, True
+    new_active = 0 if existing["active"] else 1
+    should_backfill = bool(new_active) and not existing["backfill_sent"]
+    conn.execute(
+        "UPDATE subscriptions SET active = ?, backfill_sent = backfill_sent OR ? "
+        "WHERE tg_id = ? AND position_tag = ?",
+        (new_active, 1 if should_backfill else 0, tg_id, position_tag),
+    )
     conn.commit()
     conn.close()
-    return added
+    return bool(new_active), should_backfill
 
 
 def get_subscriber_positions(tg_id: int) -> list[str]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT position_tag FROM subscriptions WHERE tg_id = ? ORDER BY position_tag", (tg_id,)
+        "SELECT position_tag FROM subscriptions WHERE tg_id = ? AND active = 1 ORDER BY position_tag",
+        (tg_id,),
     ).fetchall()
     conn.close()
     return [r["position_tag"] for r in rows]
@@ -691,7 +713,7 @@ def subscriber_stats():
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
     by_tag = conn.execute(
         """SELECT position_tag AS tag, COUNT(*) c
-           FROM subscriptions GROUP BY tag ORDER BY c DESC"""
+           FROM subscriptions WHERE active = 1 GROUP BY tag ORDER BY c DESC"""
     ).fetchall()
     conn.close()
     return total, by_tag
@@ -710,6 +732,7 @@ def get_subscribers_for_tag(position_tag: str | list[str]):
         f"""SELECT DISTINCT subscriptions.tg_id FROM subscriptions
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
            WHERE subscriptions.position_tag IN ({placeholders})
+             AND subscriptions.active = 1
              AND subscribers.subscription_until IS NOT NULL
              AND subscribers.subscription_until > ?""",
         (*tags, datetime.now().isoformat()),

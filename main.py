@@ -2204,21 +2204,16 @@ async def cb_subscribe_position(callback: CallbackQuery):
         return
 
     current = db.get_subscriber_positions(tg_id)
-    if position_tag in current:
-        # уже выбрано — снятие запрещено намеренно: иначе человек может
-        # набирать вакансии по кругу (выбрал → получил бэкфилл → снял →
-        # выбрал другую), обходя лимит MAX_POSITIONS_PER_FLEET. Поменять
-        # выбор можно только через админа командой /setposition.
-        await callback.answer(t(lang, "already_locked_tag"), show_alert=True)
-        return
-    # лимит считаем ТОЛЬКО в рамках этого же флота — можно выбрать до
-    # MAX_POSITIONS_PER_FLEET в каждом из трёх разделов независимо
-    current_in_fleet = [tag for tag in current if TAG_TO_FLEET.get(tag) == fleet_key]
-    if len(current_in_fleet) >= MAX_POSITIONS_PER_FLEET:
-        await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS_PER_FLEET), show_alert=True)
-        return
+    if position_tag not in current:
+        # добавляем новую — лимит считаем ТОЛЬКО в рамках этого же флота,
+        # можно выбрать до MAX_POSITIONS_PER_FLEET в каждом из трёх разделов
+        # независимо
+        current_in_fleet = [tag for tag in current if TAG_TO_FLEET.get(tag) == fleet_key]
+        if len(current_in_fleet) >= MAX_POSITIONS_PER_FLEET:
+            await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS_PER_FLEET), show_alert=True)
+            return
 
-    added = db.toggle_subscription(tg_id, position_tag)
+    is_active, should_backfill = db.toggle_subscription(tg_id, position_tag)
 
     # обновляем только галочки на клавиатуре этого же департамента — текст-
     # приглашение ("выберите должности...") остаётся тем же на протяжении
@@ -2231,7 +2226,16 @@ async def cb_subscribe_position(callback: CallbackQuery):
     except TelegramAPIError:
         pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
 
+    if not is_active:
+        await callback.answer(t(lang, "unsubscribed", tag=position_tag))
+        return
+
     await callback.answer(t(lang, "subscribed", tag=position_tag))
+    if not should_backfill:
+        # бэкфилл по этой должности уже отправляли раньше (человек снимал и
+        # выбрал снова) — не шлём повторно, чтобы не открывать дыру для
+        # накрутки вакансий через снятие/повторный выбор по кругу
+        return
     backfill = db.get_recent_published_by_tag(position_tag, days=BACKFILL_DAYS)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
