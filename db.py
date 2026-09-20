@@ -112,6 +112,10 @@ def init_db():
         # tg_id напрямую — только customer_id), и 2) генерировать ссылку на
         # Customer Portal для самостоятельной отмены подписки
         conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
+    if "digest_demo_clicks" not in sub_cols:
+        # лимит на бесплатное демо "5 случайных email" — иначе можно нажимать
+        # его бесконечно и по кусочкам выкачать весь список бесплатно
+        conn.execute("ALTER TABLE subscribers ADD COLUMN digest_demo_clicks INTEGER DEFAULT 0")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -505,6 +509,25 @@ def get_tg_id_by_stripe_customer(customer_id: str) -> int | None:
     return row["tg_id"] if row else None
 
 
+def get_digest_demo_clicks(tg_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT digest_demo_clicks FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["digest_demo_clicks"] if row and row["digest_demo_clicks"] else 0
+
+
+def increment_digest_demo_clicks(tg_id: int):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET digest_demo_clicks = COALESCE(digest_demo_clicks, 0) + 1 WHERE tg_id = ?",
+        (tg_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_stripe_customer_id(tg_id: int) -> str | None:
     conn = get_conn()
     row = conn.execute(
@@ -808,8 +831,11 @@ def subscriber_stats():
 
 
 def get_subscribers_for_tag(position_tag: str | list[str]):
-    # рассылка вакансий — платная фича: шлём только тем, у кого подписка
-    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность.
+    # вакансии шлём ВСЕМ, кто когда-либо выбрал эту должность и не снял её —
+    # независимо от того, активна ли у них сейчас подписка/триал. Оплата
+    # решает только видимость контакта внутри самой вакансии (см.
+    # hide_contact в main.py), а не сам факт получения вакансий. Блокировку
+    # (/blockuser) по-прежнему уважаем — заблокированный не получает ничего.
     # Принимает и один тег, и список — список нужен для обратной совместимости
     # со старыми тегами, переименованными при переходе на разделение по
     # флотам (см. LEGACY_TAG_ALIASES в main.py)
@@ -821,9 +847,8 @@ def get_subscribers_for_tag(position_tag: str | list[str]):
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
            WHERE subscriptions.position_tag IN ({placeholders})
              AND subscriptions.active = 1
-             AND subscribers.subscription_until IS NOT NULL
-             AND subscribers.subscription_until > ?""",
-        (*tags, datetime.now().isoformat()),
+             AND (subscribers.is_blocked IS NULL OR subscribers.is_blocked = 0)""",
+        tags,
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]

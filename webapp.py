@@ -19,6 +19,7 @@ import db
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 STRIPE_SUBSCRIPTION_DAYS = 30  # держим в одном месте — совпадает с SUBSCRIPTION_DAYS в main.py
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -44,6 +45,26 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
     if not hmac.compare_digest(calculated_hash, received_hash):
         return None
     return parsed
+
+
+async def _notify_admin_unmatched_payment(bot, kind: str, ref: str, amount: float, currency: str, charge_id: str):
+    """Оплата прошла, но привязать её к конкретному tg_id не удалось —
+    вероятно, оплатили не по ссылке из бота, а по прямой ссылке Stripe.
+    Шлём админам детали, чтобы доставить дайджест/доступ вручную."""
+    text = (
+        f"⚠️ Оплата ({kind}) прошла, но получатель не определён — доставьте вручную.\n\n"
+        f"Сумма: {amount} {currency}\n"
+        f"charge_id: {charge_id}\n"
+        f"client_reference_id: {ref or '(пусто)'}\n\n"
+        f"Похоже, оплатили не по ссылке из бота — та добавляет ?client_reference_id "
+        f"автоматически. Найдите покупателя (email в Stripe Dashboard → Payments) "
+        f"и доставьте вручную через /grant или /broadcastuser."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
 
 
 def vacancy_to_dict(row) -> dict:
@@ -127,6 +148,8 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                         await on_stripe_digest_payment(bot, tg_id, amount, currency, charge_id)
                     except Exception as e:
                         print(f"[stripe webhook] Ошибка доставки дайджеста для tg_id={tg_id}: {e}")
+                else:
+                    await _notify_admin_unmatched_payment(bot, "digest", ref, amount, currency, charge_id)
             elif ref.isdigit() and on_stripe_payment:
                 tg_id = int(ref)
                 if customer_id:
@@ -140,6 +163,13 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                     await on_stripe_payment(bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки оплаты для tg_id={tg_id}: {e}")
+            else:
+                # платёж пришёл, но мы не понимаем, кому его доставить — скорее
+                # всего, человек оплатил по "голой" ссылке из Stripe Dashboard
+                # напрямую, а не по ссылке из бота (та добавляет
+                # ?client_reference_id=... автоматически). Доставить нужно
+                # будет вручную — админ узнаёт об этом сразу, а не от клиента
+                await _notify_admin_unmatched_payment(bot, "unknown", ref, amount, currency, charge_id)
 
         elif event["type"] == "invoice.payment_succeeded":
             invoice = event["data"]["object"]

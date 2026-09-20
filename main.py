@@ -271,6 +271,8 @@ TR = {
         "digest_count_result": "📧 {count} emails available for the last 7 days.",
         "digest_demo_button": "🎁 Free demo — 5 random emails",
         "digest_demo_result": "Here are 5 random emails out of {count} available (last 7 days):\n\n{sample}\n\nWant all {count}? Get the full list above.",
+        "digest_demo_left": "Free demo uses left: {left}.",
+        "digest_demo_limit_reached": "You've used both free demo tries. Get the full list above to see all emails.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
         "payment_thanks": "✅ Payment received — active until {until}. Now pick your positions:",
         "max_positions": "You can pick up to {max} positions per fleet.",
@@ -337,6 +339,8 @@ TR = {
         "digest_count_result": "📧 Доступно {count} email за последние 7 дней.",
         "digest_demo_button": "🎁 Бесплатное демо — 5 случайных email",
         "digest_demo_result": "Вот 5 случайных email из {count} доступных (за последние 7 дней):\n\n{sample}\n\nХотите все {count}? Оформите полный список выше.",
+        "digest_demo_left": "Осталось бесплатных попыток демо: {left}.",
+        "digest_demo_limit_reached": "Вы уже использовали обе бесплатные попытки демо. Оформите полный список выше, чтобы увидеть все email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
         "payment_thanks": "✅ Оплата прошла — активно до {until}. Теперь выберите должности:",
         "max_positions": "Можно выбрать не больше {max} должностей в одном флоте.",
@@ -403,6 +407,8 @@ TR = {
         "digest_count_result": "📧 Доступно {count} email за останні 7 днів.",
         "digest_demo_button": "🎁 Безкоштовне демо — 5 випадкових email",
         "digest_demo_result": "Ось 5 випадкових email із {count} доступних (за останні 7 днів):\n\n{sample}\n\nХочете всі {count}? Оформіть повний список вище.",
+        "digest_demo_left": "Залишилось безкоштовних спроб демо: {left}.",
+        "digest_demo_limit_reached": "Ви вже використали обидві безкоштовні спроби демо. Оформіть повний список вище, щоб побачити всі email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
         "payment_thanks": "✅ Оплату отримано — активно до {until}. Тепер оберіть посади:",
         "max_positions": "Можна обрати не більше {max} посад в одному флоті.",
@@ -1203,6 +1209,9 @@ async def cb_digest_count(callback: CallbackQuery):
     await callback.answer(t(lang, "digest_count_result", count=count), show_alert=True)
 
 
+DIGEST_DEMO_MAX_CLICKS = 2
+
+
 @router.callback_query(F.data == "digest_demo")
 async def cb_digest_demo(callback: CallbackQuery):
     tg_id = callback.from_user.id
@@ -1210,14 +1219,25 @@ async def cb_digest_demo(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
+    clicks = db.get_digest_demo_clicks(tg_id)
+    if clicks >= DIGEST_DEMO_MAX_CLICKS:
+        # иначе можно нажимать бесконечно и по кусочкам бесплатно выкачать
+        # весь список — 5 штук за раз, но не больше 2 раз всего
+        await callback.answer(t(lang, "digest_demo_limit_reached"), show_alert=True)
+        return
     contacts = db.list_contacts_since(7)
     if not contacts:
         await callback.answer(t(lang, "digest_empty"), show_alert=True)
         return
     sample = random.sample(contacts, min(5, len(contacts)))
     lines = "\n".join(f"• {c}" for c in sample)
+    db.increment_digest_demo_clicks(tg_id)
     await callback.answer()
-    await callback.message.answer(t(lang, "digest_demo_result", count=len(contacts), sample=lines))
+    left = DIGEST_DEMO_MAX_CLICKS - clicks - 1
+    await callback.message.answer(
+        t(lang, "digest_demo_result", count=len(contacts), sample=lines)
+        + "\n\n" + t(lang, "digest_demo_left", left=left)
+    )
 
 
 @router.message(Command("getemails"))
@@ -1820,6 +1840,11 @@ async def cmd_grant(message: Message, command: CommandObject):
     tg_id = row["tg_id"]
     new_until = db.extend_subscription(tg_id, days)
     db.unlock_positions(tg_id)
+    # /grant — это оплата не картой (наличка, перевод и т.п.), а не бесплатный
+    # подарок, поэтому пишем её в payments так же, как обычный платёж —
+    # иначе count_payments() не увидит эту оплату, и человеку продолжит
+    # скрываться контакт в вакансиях как будто он ничего не платил
+    db.insert_payment(tg_id, 0, days, f"manual_{int(time.time())}", provider="manual", currency="")
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
     await message.answer(f"✅ Выдал доступ на {days} дней. Активно до {until_str}.")
     lang = db.get_subscriber_language(tg_id)
@@ -2685,6 +2710,24 @@ async def main():
             print(f"[main] Не удалось установить кнопку меню мини-приложения: {e}")
     else:
         print("[main] WEBAPP_URL не задан — мини-приложение (поиск вакансий) не запущено")
+
+    # текст, который человек видит в ПУСТОМ чате с ботом ДО того, как нажал
+    # Start — Bot API это поддерживает напрямую, ставим один раз при
+    # каждом запуске (Telegram сам не даёт понять, изменился ли текст,
+    # так что дешевле просто переустанавливать каждый раз)
+    try:
+        await bot.set_my_short_description(
+            short_description="Присылает вакансии моряков по выбранной должности — Merchant/Offshore/Tanker."
+        )
+        await bot.set_my_description(
+            description=(
+                "🚢 Этот бот присылает вам вакансии по должности, которую вы выберете при "
+                "подписке — Торговый флот, Офшор или Танкера.\n\n"
+                "Бесплатно 3 дня, дальше — платная подписка. Нажмите Start, чтобы начать."
+            )
+        )
+    except TelegramAPIError as e:
+        print(f"[main] Не удалось установить описание бота: {e}")
 
     await dp.start_polling(bot)
 
