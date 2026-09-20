@@ -167,6 +167,94 @@ def init_db():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_vacancy_log (
+            tg_id INTEGER,
+            vacancy_id INTEGER,
+            sent_at TEXT,
+            PRIMARY KEY (tg_id, vacancy_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT,
+            time_hhmm TEXT,
+            text TEXT,
+            active INTEGER DEFAULT 1,
+            last_sent_date TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def add_scheduled_ad(channel: str, time_hhmm: str, text: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO scheduled_ads (channel, time_hhmm, text, active) VALUES (?, ?, ?, 1)",
+        (channel, time_hhmm, text),
+    )
+    conn.commit()
+    ad_id = cur.lastrowid
+    conn.close()
+    return ad_id
+
+
+def list_scheduled_ads():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM scheduled_ads ORDER BY time_hhmm").fetchall()
+    conn.close()
+    return rows
+
+
+def delete_scheduled_ad(ad_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM scheduled_ads WHERE id = ?", (ad_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_due_ads(current_hhmm: str, today: str):
+    """Реклама, время которой наступило и которая ещё не отправлялась
+    сегодня — планировщик вызывает это раз в минуту."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM scheduled_ads
+           WHERE active = 1 AND time_hhmm = ?
+             AND (last_sent_date IS NULL OR last_sent_date != ?)""",
+        (current_hhmm, today),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_ad_sent_today(ad_id: int, today: str):
+    conn = get_conn()
+    conn.execute("UPDATE scheduled_ads SET last_sent_date = ? WHERE id = ?", (today, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def was_vacancy_sent(tg_id: int, vacancy_id: int) -> bool:
+    """Гарантия на уровне вакансии (а не только тега): человек не должен
+    получить одну и ту же вакансию дважды, даже если пере-подписался, снял
+    и выбрал должность заново, или ему продлили доступ. Проверяется перед
+    ЛЮБОЙ личной отправкой вакансии (бэкфилл и обычное уведомление)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM sent_vacancy_log WHERE tg_id = ? AND vacancy_id = ?", (tg_id, vacancy_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_vacancy_sent(tg_id: int, vacancy_id: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_vacancy_log (tg_id, vacancy_id, sent_at) VALUES (?, ?, ?)",
+        (tg_id, vacancy_id, datetime.now().isoformat()),
+    )
     conn.commit()
     conn.close()
 
