@@ -37,7 +37,7 @@ def init_db():
     # миграция для уже существующих баз (добавились salary/documents/nationality/duration/notes/raw_text)
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vacancies)")}
     for col in ("salary", "documents", "nationality", "duration", "notes", "raw_text",
-                "position_tag", "vessel_tag"):
+                "position_tag", "vessel_tag", "fleet_tag"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} TEXT")
 
@@ -163,6 +163,55 @@ def init_db():
         conn.execute("ALTER TABLE subscriptions ADD COLUMN active INTEGER DEFAULT 1")
     if "backfill_sent" not in sub_cols:
         conn.execute("ALTER TABLE subscriptions ADD COLUMN backfill_sent INTEGER DEFAULT 0")
+    if "fleet_tag" not in sub_cols:
+        # флот теперь отдельное поле, а не суффикс в самом теге — одна и та
+        # же должность (например "Master") выбирается независимо в каждом
+        # из трёх флотов. PRIMARY KEY у старой таблицы был (tg_id,
+        # position_tag) — этого мало (не даст выбрать "Master" сразу в двух
+        # флотах), поэтому пересобираем таблицу целиком, разбирая старые
+        # суффиксные теги (ChiefEngineerOffshore → ChiefEngineer + Offshore)
+        _OLD_SUFFIX_TO_FLEET = [("Offshore", "Offshore"), ("Tanker", "Tanker")]
+        _OLD_DPO_TAGS = {
+            "MasterSDPO": "Offshore", "ChiefOfficerDPO": "Offshore",
+            "SecondOfficerDPO": "Offshore", "ThirdOfficerJDPO": "Offshore",
+        }
+        _OFFSHORE_ONLY = {  # теги, которые и раньше не имели суффикса, но были только офшорными
+            "SafetyOfficer", "HLO", "Roustabout", "CraneOperator", "GangwayOperator",
+            "Rigger", "Campboss", "ChiefSteward", "ROVPilot", "ClientRepresentative",
+            "OnlineSurvey", "SurveyEngineer", "Diver", "Scaffolder", "WinchOperator",
+        }
+        old_rows = conn.execute("SELECT * FROM subscriptions").fetchall()
+        conn.execute("ALTER TABLE subscriptions RENAME TO subscriptions_old")
+        conn.execute("""
+            CREATE TABLE subscriptions (
+                tg_id INTEGER,
+                position_tag TEXT,
+                fleet_tag TEXT,
+                subscribed_at TEXT,
+                active INTEGER DEFAULT 1,
+                backfill_sent INTEGER DEFAULT 0,
+                PRIMARY KEY (tg_id, position_tag, fleet_tag)
+            )
+        """)
+        for row in old_rows:
+            old_tag = row["position_tag"]
+            if old_tag in _OLD_DPO_TAGS:
+                new_tag, fleet = old_tag, _OLD_DPO_TAGS[old_tag]
+            elif old_tag in _OFFSHORE_ONLY:
+                new_tag, fleet = old_tag, "Offshore"
+            else:
+                new_tag, fleet = old_tag, "Merchant"
+                for suffix, fleet_name in _OLD_SUFFIX_TO_FLEET:
+                    if old_tag.endswith(suffix):
+                        new_tag, fleet = old_tag[: -len(suffix)], fleet_name
+                        break
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions "
+                "(tg_id, position_tag, fleet_tag, subscribed_at, active, backfill_sent) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (row["tg_id"], new_tag, fleet, row["subscribed_at"], row["active"], row["backfill_sent"]),
+            )
+        conn.execute("DROP TABLE subscriptions_old")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS click_events (
@@ -299,8 +348,8 @@ def insert_vacancy(fields: dict, dedup_key: str, raw_text: str = "") -> int:
         """INSERT INTO vacancies
            (position, vessel, region, nationality, dates, duration, rotation, salary,
             documents, contact, requirements, notes, hashtags, position_tag, vessel_tag,
-            dedup_key, raw_text, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+            fleet_tag, dedup_key, raw_text, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
         (
             fields.get("position"), fields.get("vessel"), fields.get("region"),
             fields.get("nationality"), fields.get("date"), fields.get("duration"),
@@ -310,7 +359,7 @@ def insert_vacancy(fields: dict, dedup_key: str, raw_text: str = "") -> int:
             "\n".join(fields.get("requirements") or []),
             fields.get("notes"),
             fields.get("hashtags"),
-            fields.get("position_tag"), fields.get("vessel_tag"),
+            fields.get("position_tag"), fields.get("vessel_tag"), fields.get("fleet_tag"),
             dedup_key, raw_text, datetime.now().isoformat(),
         ),
     )
@@ -750,39 +799,37 @@ def get_subscribers_list():
     result = []
     for s in subs:
         positions = conn.execute(
-            "SELECT position_tag FROM subscriptions WHERE tg_id = ? AND active = 1", (s["tg_id"],)
+            "SELECT position_tag, fleet_tag FROM subscriptions WHERE tg_id = ? AND active = 1",
+            (s["tg_id"],),
         ).fetchall()
         result.append({
             "tg_id": s["tg_id"],
             "username": s["username"],
             "language": s["language"],
             "subscription_until": s["subscription_until"],
-            "positions": [p["position_tag"] for p in positions],
+            "positions": [f"{p['position_tag']} ({p['fleet_tag']})" for p in positions],
         })
     conn.close()
     return result
 
 
-def toggle_subscription(tg_id: int, position_tag: str) -> tuple[bool, bool]:
-    """Переключает подписку на должность (активирует, если выключена/не было —
-    выключает, если уже активна). В отличие от старой версии, строка не
-    удаляется при снятии — сохраняем историю, чтобы не слать бэкфилл повторно
-    при повторном включении той же должности (иначе можно снять-выбрать по
-    кругу и выкачать вакансии бесконечно).
-    Возвращает (is_active, should_send_backfill):
-      is_active — включена ли должность СЕЙЧАС, после этого вызова
-      should_send_backfill — нужно ли прислать бэкфилл (True только когда
-      должность включена и бэкфилл по ней ещё ни разу не отправлялся)"""
+def toggle_subscription(tg_id: int, position_tag: str, fleet_tag: str) -> tuple[bool, bool]:
+    """Переключает подписку на должность В КОНКРЕТНОМ ФЛОТЕ (одна и та же
+    должность, например Master, выбирается в Merchant/Tanker/Offshore
+    независимо — это разные подписки). Строка не удаляется при снятии —
+    сохраняем историю, чтобы не слать бэкфилл повторно при повторном
+    включении той же должности.
+    Возвращает (is_active, should_send_backfill)."""
     conn = get_conn()
     existing = conn.execute(
-        "SELECT active, backfill_sent FROM subscriptions WHERE tg_id = ? AND position_tag = ?",
-        (tg_id, position_tag),
+        "SELECT active, backfill_sent FROM subscriptions WHERE tg_id = ? AND position_tag = ? AND fleet_tag = ?",
+        (tg_id, position_tag, fleet_tag),
     ).fetchone()
     if existing is None:
         conn.execute(
-            "INSERT INTO subscriptions (tg_id, position_tag, subscribed_at, active, backfill_sent) "
-            "VALUES (?, ?, ?, 1, 1)",
-            (tg_id, position_tag, datetime.now().isoformat()),
+            "INSERT INTO subscriptions (tg_id, position_tag, fleet_tag, subscribed_at, active, backfill_sent) "
+            "VALUES (?, ?, ?, ?, 1, 1)",
+            (tg_id, position_tag, fleet_tag, datetime.now().isoformat()),
         )
         conn.commit()
         conn.close()
@@ -791,30 +838,36 @@ def toggle_subscription(tg_id: int, position_tag: str) -> tuple[bool, bool]:
     should_backfill = bool(new_active) and not existing["backfill_sent"]
     conn.execute(
         "UPDATE subscriptions SET active = ?, backfill_sent = backfill_sent OR ? "
-        "WHERE tg_id = ? AND position_tag = ?",
-        (new_active, 1 if should_backfill else 0, tg_id, position_tag),
+        "WHERE tg_id = ? AND position_tag = ? AND fleet_tag = ?",
+        (new_active, 1 if should_backfill else 0, tg_id, position_tag, fleet_tag),
     )
     conn.commit()
     conn.close()
     return bool(new_active), should_backfill
 
 
-def get_subscriber_positions(tg_id: int) -> list[str]:
+def get_subscriber_positions(tg_id: int) -> list[tuple[str, str]]:
+    """Возвращает список (position_tag, fleet_tag) — та же должность в
+    разных флотах теперь считается разными подписками."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT position_tag FROM subscriptions WHERE tg_id = ? AND active = 1 ORDER BY position_tag",
+        "SELECT position_tag, fleet_tag FROM subscriptions WHERE tg_id = ? AND active = 1 "
+        "ORDER BY fleet_tag, position_tag",
         (tg_id,),
     ).fetchall()
     conn.close()
-    return [r["position_tag"] for r in rows]
+    return [(r["position_tag"], r["fleet_tag"]) for r in rows]
 
 
-def clear_subscriber_positions(tg_id: int):
-    """Полностью снимает все текущие должности подписчика — используется
-    админской командой /setposition для ручной смены выбора в обход
-    обычной блокировки."""
+def clear_subscriber_positions(tg_id: int, fleet_tag: str | None = None):
+    """Снимает текущие должности подписчика — используется админской
+    командой /setposition для ручной смены выбора в обход обычной
+    блокировки. Если fleet_tag не указан — снимает во ВСЕХ флотах."""
     conn = get_conn()
-    conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
+    if fleet_tag:
+        conn.execute("DELETE FROM subscriptions WHERE tg_id = ? AND fleet_tag = ?", (tg_id, fleet_tag))
+    else:
+        conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
     conn.commit()
     conn.close()
 
@@ -823,52 +876,42 @@ def subscriber_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
     by_tag = conn.execute(
-        """SELECT position_tag AS tag, COUNT(*) c
-           FROM subscriptions WHERE active = 1 GROUP BY tag ORDER BY c DESC"""
+        """SELECT position_tag || ' (' || fleet_tag || ')' AS tag, COUNT(*) c
+           FROM subscriptions WHERE active = 1 GROUP BY position_tag, fleet_tag ORDER BY c DESC"""
     ).fetchall()
     conn.close()
     return total, by_tag
 
 
-def get_subscribers_for_tag(position_tag: str | list[str]):
-    # вакансии шлём ВСЕМ, кто когда-либо выбрал эту должность и не снял её —
-    # независимо от того, активна ли у них сейчас подписка/триал. Оплата
-    # решает только видимость контакта внутри самой вакансии (см.
-    # hide_contact в main.py), а не сам факт получения вакансий. Блокировку
-    # (/blockuser) по-прежнему уважаем — заблокированный не получает ничего.
-    # Принимает и один тег, и список — список нужен для обратной совместимости
-    # со старыми тегами, переименованными при переходе на разделение по
-    # флотам (см. LEGACY_TAG_ALIASES в main.py)
-    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
+def get_subscribers_for_tag(position_tag: str, fleet_tag: str):
+    # вакансии шлём ВСЕМ, кто когда-либо выбрал эту должность В ЭТОМ ФЛОТЕ и
+    # не снял её — независимо от того, активна ли у них сейчас подписка/
+    # триал. Оплата решает только видимость контакта внутри самой вакансии
+    # (см. hide_contact в main.py), а не сам факт получения вакансий.
+    # Блокировку (/blockuser) по-прежнему уважаем.
     conn = get_conn()
-    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        f"""SELECT DISTINCT subscriptions.tg_id FROM subscriptions
+        """SELECT DISTINCT subscriptions.tg_id FROM subscriptions
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
-           WHERE subscriptions.position_tag IN ({placeholders})
+           WHERE subscriptions.position_tag = ? AND subscriptions.fleet_tag = ?
              AND subscriptions.active = 1
              AND (subscribers.is_blocked IS NULL OR subscribers.is_blocked = 0)""",
-        tags,
+        (position_tag, fleet_tag),
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
 
 
-def get_recent_published_by_tag(position_tag: str | list[str], days: int = 7):
-    """Бэкфилл для новых подписчиков — опубликованные вакансии этой должности
-    за последние `days` суток, от старых к новым. Принимает и один тег, и
-    список (для обратной совместимости со старыми тегами, см.
-    LEGACY_TAG_ALIASES в main.py — старые вакансии до переезда на флоты
-    хранят прежнее короткое название тега)."""
-    tags = [position_tag] if isinstance(position_tag, str) else list(position_tag)
+def get_recent_published_by_tag(position_tag: str, fleet_tag: str, days: int = 7):
+    """Бэкфилл для новых подписчиков — опубликованные вакансии этой
+    должности В ЭТОМ ФЛОТЕ за последние `days` суток, от старых к новым."""
     conn = get_conn()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-    placeholders = ",".join("?" for _ in tags)
     rows = conn.execute(
-        f"""SELECT * FROM vacancies
-           WHERE status = 'published' AND position_tag IN ({placeholders}) AND created_at > ?
+        """SELECT * FROM vacancies
+           WHERE status = 'published' AND position_tag = ? AND fleet_tag = ? AND created_at > ?
            ORDER BY created_at ASC""",
-        (*tags, cutoff),
+        (position_tag, fleet_tag, cutoff),
     ).fetchall()
     conn.close()
     return rows

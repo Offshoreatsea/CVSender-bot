@@ -81,134 +81,105 @@ EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # 
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
-# Фиксированный список должностей — единственный источник правды для тегов
-# #Position и для матчинга в /subscribe. Если встретится реально новая
-# должность, которой тут нет, — просто допишите строку в список, ничего
-# больше менять не нужно.
+# Фиксированный список должностей — общий для всех трёх флотов (Merchant,
+# Tanker, Offshore частично пересекаются по названиям — например "Master"
+# существует во всех трёх, но это РАЗНЫЕ подписки, различаются полем
+# fleet_tag, а не суффиксом в самом теге). Источник правды для тегов
+# #Position и для матчинга в /subscribe.
 RANK_TAGS = [
-    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer", "DeckCadet",
-    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "JuniorEngineer", "EngineCadet",
-    "ETO", "Electrician", "RefEngineer", "GasEngineer",
+    "Master", "ChiefOfficer", "ChiefOfficerSDPO", "SecondOfficer", "SecondOfficerDPO",
+    "SecondOfficerJDPO", "ThirdOfficer", "ThirdOfficerJDPO", "JuniorOfficer", "MasterSDPO",
+    "DeckCadet", "SafetyOfficer", "HLO",
+    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer", "EngineCadet",
+    "ETO", "Electrician", "ElectricianAssistant", "RefEngineer", "GasEngineer",
     "Bosun", "AB", "OS", "Roustabout", "Motorman", "Oiler", "Wiper", "Fitter", "Welder",
+    "CraneOperator", "GangwayOperator", "Rigger",
     "Cook", "NightCook", "Steward", "Campboss", "ChiefSteward", "Messman", "Baker",
-    "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Scaffolder",
-    "ClientRepresentative", "SafetyOfficer", "Surveyor", "SurveyEngineer", "OnlineSurvey",
-    "Diver", "WinchOperator", "GangwayOperator", "HLO",
-    "MasterSDPO", "ChiefOfficerDPO", "SecondOfficerDPO", "ThirdOfficerJDPO",
 ]
 
-# Группировка тегов по департаментам — чисто вопрос навигации в /subscribe,
-# на матчинг вакансий и хранение подписок не влияет (там как был, так и
-# остался плоский position_tag). Названия департаментов включают префикс
-# флота (Merchant / Offshore), чтобы разделить экраны выбора без отдельного
-# уровня "выбери флот" — это просто более длинный список кнопок.
-MERCHANT_DEPARTMENTS = {
+# Департаменты для Merchant и Tanker — идентичная структура у обоих флотов
+# (одни и те же названия должностей, отличие только в поле fleet_tag)
+MERCHANT_TANKER_DEPARTMENTS = {
     "Bridge Officers": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer"],
     "Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
-                        "ETO", "Electrician", "RefEngineer", "GasEngineer"],
+                        "RefEngineer", "ETO", "Electrician", "GasEngineer"],
     "Deck Ratings": ["Bosun", "AB", "OS", "Fitter", "Welder", "DeckCadet"],
     "Engine Ratings": ["Oiler", "Wiper", "Motorman", "Fitter", "Welder", "EngineCadet"],
     "Catering": ["Cook", "NightCook", "Steward", "Messman", "Baker"],
 }
 
 OFFSHORE_DEPARTMENTS = {
-    "Bridge Officers": ["MasterSDPO", "ChiefOfficerDPO", "SecondOfficerDPO",
-                        "ThirdOfficerJDPO", "SafetyOfficer", "HLO"],
-    "Engine Officers": ["ChiefEngineerOffshore", "SecondEngineerOffshore", "ThirdEngineerOffshore",
-                        "JuniorEngineerOffshore", "ETOOffshore", "ElectricianOffshore"],
-    "Deck Ratings": ["BosunOffshore", "ABOffshore", "OSOffshore", "Roustabout", "CraneOperator",
-                     "GangwayOperator", "HLO", "Rigger", "FitterOffshore", "WelderOffshore", "DeckCadetOffshore"],
-    "Engine Ratings": ["OilerOffshore", "WiperOffshore", "MotormanOffshore",
-                       "FitterOffshore", "WelderOffshore", "EngineCadetOffshore"],
-    "Catering": ["CookOffshore", "NightCookOffshore", "Campboss", "StewardOffshore",
-                "ChiefSteward", "MessmanOffshore", "BakerOffshore"],
-    "Survey & Other": ["ROVPilot", "ClientRepresentative", "OnlineSurvey",
-                       "SurveyEngineer", "Diver", "Scaffolder", "WinchOperator"],
+    "Bridge Officers": ["MasterSDPO", "Master", "ChiefOfficerSDPO", "ChiefOfficer",
+                        "SecondOfficerDPO", "SecondOfficerJDPO", "SecondOfficer",
+                        "ThirdOfficerJDPO", "ThirdOfficer", "SafetyOfficer", "HLO"],
+    "Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
+                        "ETO", "Electrician", "ElectricianAssistant"],
+    "Deck Ratings": ["AB", "OS", "Bosun", "Roustabout", "CraneOperator", "GangwayOperator",
+                     "HLO", "Rigger", "Fitter", "Welder", "DeckCadet"],
+    "Engine Ratings": ["Motorman", "Oiler", "Wiper", "Fitter", "Welder", "EngineCadet"],
+    "Catering": ["Cook", "NightCook", "Campboss", "Steward", "ChiefSteward", "Messman"],
 }
 
-
-def _suffix_departments(base: dict[str, list[str]], suffix: str, extra: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
-    """Генерирует набор департаментов для нового флота на основе базового —
-    добавляет суффикс к каждому тегу, чтобы теги не пересекались между
-    флотами (иначе подписка на 'Bosun' в Tanker и 'Bosun' в Merchant была бы
-    одной и той же записью в базе, и человек получал бы вакансии обоих
-    флотов сразу — а нужна полная изоляция между разделами)."""
-    out = {}
-    for dept, tags in base.items():
-        new_tags = [f"{tag}{suffix}" for tag in tags]
-        if extra and dept in extra:
-            new_tags += [f"{tag}{suffix}" for tag in extra[dept]]
-        out[dept] = new_tags
-    return out
-
-
-TANKER_DEPARTMENTS = _suffix_departments(
-    MERCHANT_DEPARTMENTS, "Tanker", extra={"Deck Ratings": ["Pumpman"]}
-)
-
-# Три раздела вакансий в /subscribe — флот выбирается первым экраном, дальше
-# département и должности (макс. MAX_POSITIONS_PER_FLEET на флот). Подписка
-# на один флот не даёт вакансий другого — теги всех трёх флотов не
-# пересекаются (см. _suffix_departments выше).
+# Три раздела вакансий в /subscribe — флот выбирается первым экраном.
+# Должность выбирается независимо в каждом флоте (одна и та же должность,
+# например Master, может быть выбрана сразу в Merchant И в Tanker — это
+# две разные подписки).
 FLEETS = {
-    "merchant": {"label": "⚓ Торговый флот", "departments": MERCHANT_DEPARTMENTS},
-    "offshore": {"label": "🛠 Офшор", "departments": OFFSHORE_DEPARTMENTS},
-    "tanker": {"label": "🛢 Танкера", "departments": TANKER_DEPARTMENTS},
-}
-
-RANK_TAGS = sorted({
-    tag for fleet in FLEETS.values() for tags in fleet["departments"].values() for tag in tags
-})
-
-# Обратный словарь тег → флот — нужен, чтобы при выборе считать лимит именно
-# в рамках одного флота, а не по всем сразу
-TAG_TO_FLEET = {
-    tag: fleet_key for fleet_key, fleet in FLEETS.items()
-    for tags in fleet["departments"].values() for tag in tags
+    "merchant": {"label": "⚓ Торговый флот", "departments": MERCHANT_TANKER_DEPARTMENTS, "hashtag": "MerchantFleet"},
+    "offshore": {"label": "🛠 Офшор", "departments": OFFSHORE_DEPARTMENTS, "hashtag": "OffshoreFleet"},
+    "tanker": {"label": "🛢 Танкера", "departments": MERCHANT_TANKER_DEPARTMENTS, "hashtag": "TankerFleet"},
 }
 
 MAX_POSITIONS_PER_FLEET = 2
 
-# До разделения на 3 флота часть тегов Offshore-департаментов была БЕЗ
-# суффикса (например "ChiefEngineer" использовался и для Merchant, и для
-# Offshore). После переезда на изолированные теги ("ChiefEngineerOffshore")
-# у подписчиков, выбравших должность ДО этого перехода, в базе так и
-# остался старый короткий тег — а новые вакансии Claude размечает уже новым.
-# Чтобы такие подписчики не потеряли рассылку молча, при уведомлении о новой
-# офшорной вакансии дополнительно ищем и по старому тегу тоже.
-LEGACY_TAG_ALIASES = {
-    "ChiefEngineerOffshore": "ChiefEngineer",
-    "SecondEngineerOffshore": "SecondEngineer",
-    "ThirdEngineerOffshore": "ThirdEngineer",
-    "JuniorEngineerOffshore": "JuniorEngineer",
-    "ETOOffshore": "ETO",
-    "ElectricianOffshore": "Electrician",
-    "BosunOffshore": "Bosun",
-    "ABOffshore": "AB",
-    "OSOffshore": "OS",
-    "FitterOffshore": "Fitter",
-    "WelderOffshore": "Welder",
-    "DeckCadetOffshore": "DeckCadet",
-    "OilerOffshore": "Oiler",
-    "WiperOffshore": "Wiper",
-    "MotormanOffshore": "Motorman",
-    "EngineCadetOffshore": "EngineCadet",
-    "CookOffshore": "Cook",
-    "NightCookOffshore": "NightCook",
-    "StewardOffshore": "Steward",
-    "MessmanOffshore": "Messman",
-    "BakerOffshore": "Baker",
-}
-
-# Фиксированный список типов судов — тоже единый источник правды для тегов
-# и матчинга.
-VESSEL_TAGS = [
-    "Tanker", "CrudeOilTanker", "ChemicalTanker", "OilProductTanker", "LNG", "LPG",
-    "VLGC", "VLCC", "Container", "Bulk", "GeneralCargo",
-    "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "PSV", "SOV", "Tug",
-    "CableLayer", "Dredger", "Pipelay", "HeavyLift", "Cruise", "RoRo", "Ferry", "Yacht",
-    "FPSO", "JackUp",
+# Типы судов → флот. Флот вакансии определяется программно по этому словарю
+# (а не тем, что попросили угадать у Claude) — так надёжнее: одна ошибка в
+# классификации судна не разваливает всю логику подписок. Claude выбирает
+# только vessel_tag из списка ниже, а флот вычисляется автоматически.
+MERCHANT_VESSEL_TAGS = [
+    "BulkCarrier", "CapesizeBulkCarrier", "NewcastlemaxBulkCarrier", "PostPanamaxBulkCarrier",
+    "PanamaxBulkCarrier", "KamsarmaxBulkCarrier", "UltramaxBulkCarrier", "SupramaxBulkCarrier",
+    "HandymaxBulkCarrier", "HandysizeBulkCarrier", "MiniBulkCarrier", "OreCarrier", "CoalCarrier",
+    "GrainCarrier", "CementCarrier", "WoodchipCarrier", "GeneralCargoVessel", "MultipurposeVessel",
+    "HeavyLiftVessel", "ContainerShip", "FeederContainerVessel", "CoasterVessel", "RoRoVessel",
+    "RoPax", "PureCarAndTruckCarrier", "PureCarCarrier", "CarCarrier", "LivestockCarrier",
+    "ReeferVessel", "TimberCarrier", "BargeCarrier", "DeckCargoVessel", "HeavyTransportVessel",
 ]
+TANKER_VESSEL_TAGS = [
+    "ULCC", "SuezmaxTanker", "AframaxTanker", "PanamaxTanker", "HandysizeTanker", "SmallTanker",
+    "CPPTanker", "DPPTanker", "LNGCarrier", "LPGCarrier", "LEGCarrier", "AmmoniaCarrier",
+    "CO2Carrier", "ChemicalOilTanker", "JuiceCarrier", "OilTanker", "ChemicalTanker", "VLCC",
+    "VLGC", "ProductTanker", "CrudeOilTanker", "BitumenTanker", "AsphaltTanker", "EthyleneCarrier",
+    "MethanolTanker", "ShuttleTanker", "BunkeringTanker", "OilChemicalTanker",
+    "LNGBunkerVessel", "LPGBunkerVessel",
+]
+OFFSHORE_VESSEL_TAGS = [
+    "Tug", "ASDTug", "UtilityVessel", "CrewBoat", "Workboat", "Multicat", "Dredger", "DSV", "ROV",
+    "SurveyVessel", "PSV", "MPSV", "OCV", "ERRV", "AHT", "AHTS", "GeophysicalVessel",
+    "SeismicVessel", "WTIV", "WFSV", "SOV", "CSOV", "CLV", "CRV", "RockDumpingVessel", "CSV",
+    "SSCV", "DrillingVessel", "JackUp", "FallpipeVessel", "TrenchingVessel", "PLSV", "HLV",
+    "CraneVessel", "ConstructionVessel", "AccommodationVessel", "Flotel", "StandbyVessel",
+    "OSRV", "FFV", "WSV", "WIV", "WellTestingVessel",
+    "FPSO", "FSO", "FPU", "FLNG", "FSRU",  # плавучие добычные платформы — в офшоре, не в танкерах
+]
+
+VESSEL_TAGS = MERCHANT_VESSEL_TAGS + TANKER_VESSEL_TAGS + OFFSHORE_VESSEL_TAGS
+
+VESSEL_TAG_TO_FLEET = {}
+for _tag in MERCHANT_VESSEL_TAGS:
+    VESSEL_TAG_TO_FLEET[_tag] = "Merchant"
+for _tag in TANKER_VESSEL_TAGS:
+    VESSEL_TAG_TO_FLEET[_tag] = "Tanker"
+for _tag in OFFSHORE_VESSEL_TAGS:
+    VESSEL_TAG_TO_FLEET[_tag] = "Offshore"
+
+
+def vessel_tag_to_fleet(vessel_tag: str | None) -> str:
+    """Флот вакансии — вычисляется из vessel_tag программно, не спрашивается
+    у Claude напрямую (надёжнее). Если тип судна не распознан или не указан —
+    по умолчанию Merchant (самый частый и самый безопасный дефолт)."""
+    return VESSEL_TAG_TO_FLEET.get(vessel_tag, "Merchant")
+
 
 FALLBACK_TAG = "Other"
 
@@ -689,9 +660,14 @@ def ai_parse_batch(raw: str) -> list[dict]:
         vessel_tag = item.get("vessel_tag") or FALLBACK_TAG
         if vessel_tag not in VESSEL_TAGS:
             vessel_tag = FALLBACK_TAG
+        # флот — НЕ то, что вернул Claude, а вычисляется программно из
+        # vessel_tag по фиксированному словарю (надёжнее, чем спрашивать
+        # модель угадывать флот напрямую)
+        fleet_tag = vessel_tag_to_fleet(vessel_tag)
         item["position_tag"] = position_tag
         item["vessel_tag"] = vessel_tag
-        item["hashtags"] = f"#{position_tag} #{vessel_tag}"
+        item["fleet_tag"] = fleet_tag
+        item["hashtags"] = f"#{position_tag} #{vessel_tag} #{fleet_tag}Fleet"
     return data
 
 
@@ -966,11 +942,11 @@ async def do_publish(bot: Bot, vacancy_id: int):
     text = render_template(fields)  # полный текст — идёт в личные рассылки подписчикам
     caption = render_caption(fields)  # ужатая версия под лимит подписи к фото (1024 симв.)
 
-    # Танкерная вакансия — определяем по флоту её position_tag (уже
-    # классифицирован Claude на этапе разбора, см. FLEETS/TAG_TO_FLEET) —
-    # публикуется И в основной канал, И (дополнительно) в канал танкерных
-    # вакансий, с отдельной кнопкой под постом в обоих местах.
-    is_tanker = TAG_TO_FLEET.get(fields.get("position_tag")) == "tanker"
+    # Танкерная вакансия — смотрим на сохранённый fleet_tag (вычислен по
+    # типу судна при разборе, см. vessel_tag_to_fleet) — публикуется И в
+    # основной канал, И (дополнительно) в канал танкерных вакансий, с
+    # отдельной кнопкой под постом в обоих местах.
+    is_tanker = fields.get("fleet_tag") == "Tanker"
 
     message_id = await _publish_to_channel(bot, CHANNEL_ID, text, caption, vacancy_id, is_tanker)
     db.set_status(vacancy_id, "published", message_id)
@@ -1153,7 +1129,8 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
             markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
-        text = t(lang, "positions_locked_notice", tags=", ".join(selected))
+        tags_str = ", ".join(f"{tag} ({fleet})" for tag, fleet in selected)
+        text = t(lang, "positions_locked_notice", tags=tags_str)
         markup = after_subscribe_keyboard(lang, tg_id)
     else:
         selected = set(db.get_subscriber_positions(tg_id))
@@ -1454,7 +1431,7 @@ async def cb_show_fleet(callback: CallbackQuery):
         await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
         await callback.answer()
         return
-    selected = set(db.get_subscriber_positions(tg_id))
+    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
     await callback.message.edit_text(
         t(lang, "choose_department"), reply_markup=department_keyboard(fleet_key, lang, selected)
     )
@@ -1487,7 +1464,7 @@ async def cb_show_department(callback: CallbackQuery):
         await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
         await callback.answer()
         return
-    selected = set(db.get_subscriber_positions(tg_id))
+    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
     await callback.message.edit_text(
         t(lang, "choose_position"), reply_markup=subscribe_keyboard(fleet_key, dept, lang, selected)
     )
@@ -1502,7 +1479,7 @@ async def cb_department_back(callback: CallbackQuery):
         await callback.answer()
         return
     lang = db.get_subscriber_language(tg_id)
-    selected = set(db.get_subscriber_positions(tg_id))
+    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
     await callback.message.edit_text(
         t(lang, "choose_department"), reply_markup=department_keyboard(fleet_key, lang, selected)
     )
@@ -1616,12 +1593,15 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def fleet_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
-    selected = selected or set()
+def fleet_keyboard(lang: str | None = None, selected: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
+    # selected — список (position_tag, fleet_tag) из db.get_subscriber_positions();
+    # один и тот же тег может быть выбран сразу в нескольких флотах, поэтому
+    # считаем количество ПО КАЖДОМУ флоту отдельно, а не плоским множеством тегов
+    selected = selected or []
     rows = []
     for fleet_key, fleet in FLEETS.items():
-        all_tags = {tag for tags in fleet["departments"].values() for tag in tags}
-        count = len(selected & all_tags)
+        fleet_tag = fleet_key.capitalize()
+        count = sum(1 for _, f in selected if f == fleet_tag)
         label = f"{fleet['label']} ({count})" if count else fleet["label"]
         rows.append([InlineKeyboardButton(text=label, callback_data=f"fleet:{fleet_key}")])
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
@@ -2057,28 +2037,27 @@ async def cb_broadcast_confirm(callback: CallbackQuery):
 
 @router.message(Command("testnotify"))
 async def cmd_test_notify(message: Message, command: CommandObject):
-    """Диагностика рассылки: показывает, сколько активных подписчиков будет
-    найдено для данного тега (и его legacy-алиаса, если есть), без реальной
-    отправки сообщений. Помогает быстро понять — тег не совпадает, подписка
-    истекла, или подписчиков просто нет. Пример: /testnotify ChiefEngineerOffshore"""
+    """Диагностика рассылки: показывает, сколько подписчиков будет найдено
+    для данной должности в данном флоте, без реальной отправки сообщений.
+    Пример: /testnotify Master merchant (флот: merchant/offshore/tanker)"""
     if not admin_only(message.from_user.id):
         return
-    tag = (command.args or "").strip()
-    if not tag:
-        await message.answer("Использование: /testnotify [тег должности], например /testnotify Master")
+    args = (command.args or "").split()
+    if len(args) != 2 or args[1] not in FLEETS:
+        await message.answer(
+            "Использование: /testnotify [должность] [merchant|offshore|tanker]\n"
+            "Пример: /testnotify Master merchant"
+        )
         return
+    tag, fleet_key = args
     if tag not in RANK_TAGS:
         await message.answer(f"⚠️ Тег «{tag}» не найден в текущем RANK_TAGS (проверьте написание).")
         return
-    fleet = TAG_TO_FLEET.get(tag, "неизвестен")
-    alias = LEGACY_TAG_ALIASES.get(tag)
-    tags_to_match = [tag] + ([alias] if alias else [])
-    matched = db.get_subscribers_for_tag(tags_to_match)
+    fleet_tag = fleet_key.capitalize()
+    matched = db.get_subscribers_for_tag(tag, fleet_tag)
     lines = [
-        f"Тег: {tag} (флот: {fleet})",
-        f"Legacy-алиас: {alias or '—'}",
-        f"Искали по тегам: {', '.join(tags_to_match)}",
-        f"Найдено активных подписчиков: {len(matched)}",
+        f"Тег: {tag}, флот: {fleet_tag}",
+        f"Найдено подписчиков: {len(matched)}",
     ]
     if matched:
         lines.append("tg_id: " + ", ".join(str(x) for x in matched[:30]))
@@ -2089,46 +2068,44 @@ async def cmd_test_notify(message: Message, command: CommandObject):
 
 @router.message(Command("setposition"))
 async def cmd_setposition(message: Message, command: CommandObject):
-    """Ручная смена должности подписчика в обход обычной блокировки —
-    используется, когда человек ошибся при выборе или хочет сменить
-    направление посреди оплаченного периода. Пример:
-    /setposition @ivan Master,ChiefOfficer"""
+    """Ручная смена должности подписчика в ОДНОМ флоте, в обход обычной
+    блокировки — используется, когда человек ошибся при выборе или хочет
+    сменить направление посреди оплаченного периода. Должности в других
+    флотах не трогает. Пример:
+    /setposition @ivan merchant Master,ChiefOfficer"""
     if not admin_only(message.from_user.id):
         return
-    args = (command.args or "").split(maxsplit=1)
-    if len(args) < 2:
+    args = (command.args or "").split(maxsplit=2)
+    if len(args) < 3 or args[1] not in FLEETS:
         await message.answer(
-            "Использование: /setposition [@username или id] [должность1,должность2,...]\n"
-            "Названия должностей — как в RANK_TAGS, например: Master,ChiefOfficer"
+            "Использование: /setposition [@username или id] [merchant|offshore|tanker] "
+            "[должность1,должность2]\n"
+            "Пример: /setposition @ivan merchant Master,ChiefOfficer"
         )
         return
-    handle, tags_raw = args
+    handle, fleet_key, tags_raw = args
+    fleet_tag = fleet_key.capitalize()
     row = db.find_subscriber_by_handle(handle)
     if not row:
         await message.answer(f"Не нашёл {handle} в базе.")
         return
     tags = [tag.strip() for tag in tags_raw.split(",") if tag.strip()]
-    unknown = [tag for tag in tags if tag not in RANK_TAGS]
+    valid_tags_for_fleet = {tag for tags_ in FLEETS[fleet_key]["departments"].values() for tag in tags_}
+    unknown = [tag for tag in tags if tag not in valid_tags_for_fleet]
     if unknown:
-        await message.answer(f"Неизвестные должности: {', '.join(unknown)}. Проверьте написание.")
+        await message.answer(
+            f"Неизвестные для флота {fleet_tag} должности: {', '.join(unknown)}. Проверьте написание."
+        )
         return
-    # лимит проверяем по каждому флоту отдельно, а не суммарно — можно
-    # выдать до MAX_POSITIONS_PER_FLEET в каждом из трёх разделов
-    per_fleet_count: dict[str, int] = {}
-    for tag in tags:
-        fleet_key = TAG_TO_FLEET.get(tag, "?")
-        per_fleet_count[fleet_key] = per_fleet_count.get(fleet_key, 0) + 1
-    over_limit = {f: c for f, c in per_fleet_count.items() if c > MAX_POSITIONS_PER_FLEET}
-    if over_limit:
-        parts = [f"{FLEETS.get(f, {}).get('label', f)} — {c}" for f, c in over_limit.items()]
-        await message.answer(f"Максимум {MAX_POSITIONS_PER_FLEET} должности на флот. Превышено: {', '.join(parts)}")
+    if len(tags) > MAX_POSITIONS_PER_FLEET:
+        await message.answer(f"Максимум {MAX_POSITIONS_PER_FLEET} должности на флот.")
         return
     tg_id = row["tg_id"]
-    db.clear_subscriber_positions(tg_id)
+    db.clear_subscriber_positions(tg_id, fleet_tag)  # снимаем только в этом флоте
     for tag in tags:
-        db.toggle_subscription(tg_id, tag)
+        db.toggle_subscription(tg_id, tag, fleet_tag)
     db.lock_positions(tg_id)
-    await message.answer(f"✅ Установил {handle}: {', '.join(tags)}.")
+    await message.answer(f"✅ Установил {handle} ({fleet_tag}): {', '.join(tags)}.")
     lang = db.get_subscriber_language(tg_id)
     try:
         await message.bot.send_message(
@@ -2394,22 +2371,23 @@ async def cb_subscribe_position(callback: CallbackQuery):
         await callback.answer()
         return
 
-    current = db.get_subscriber_positions(tg_id)
-    if position_tag not in current:
+    fleet_tag = fleet_key.capitalize()  # "merchant" -> "Merchant" и т.д.
+    current = db.get_subscriber_positions(tg_id)  # список (position_tag, fleet_tag)
+    current_in_fleet = [tag for tag, f in current if f == fleet_tag]
+    if position_tag not in current_in_fleet:
         # добавляем новую — лимит считаем ТОЛЬКО в рамках этого же флота,
         # можно выбрать до MAX_POSITIONS_PER_FLEET в каждом из трёх разделов
         # независимо
-        current_in_fleet = [tag for tag in current if TAG_TO_FLEET.get(tag) == fleet_key]
         if len(current_in_fleet) >= MAX_POSITIONS_PER_FLEET:
             await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS_PER_FLEET), show_alert=True)
             return
 
-    is_active, should_backfill = db.toggle_subscription(tg_id, position_tag)
+    is_active, should_backfill = db.toggle_subscription(tg_id, position_tag, fleet_tag)
 
     # обновляем только галочки на клавиатуре этого же департамента — текст-
     # приглашение ("выберите должности...") остаётся тем же на протяжении
     # всего мульти-выбора
-    selected = set(db.get_subscriber_positions(tg_id))
+    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_tag}
     try:
         await callback.message.edit_reply_markup(
             reply_markup=subscribe_keyboard(fleet_key, dept, lang, selected)
@@ -2427,7 +2405,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
         # выбрал снова) — не шлём повторно, чтобы не открывать дыру для
         # накрутки вакансий через снятие/повторный выбор по кругу
         return
-    backfill = db.get_recent_published_by_tag(position_tag, days=BACKFILL_DAYS)
+    backfill = db.get_recent_published_by_tag(position_tag, fleet_tag, days=BACKFILL_DAYS)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
@@ -2441,9 +2419,7 @@ async def cb_subscribe_position(callback: CallbackQuery):
         try:
             await callback.bot.send_message(
                 tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
-                reply_markup=channel_keyboard(
-                    row["id"], is_tanker=TAG_TO_FLEET.get(fields.get("position_tag")) == "tanker"
-                ),
+                reply_markup=channel_keyboard(row["id"], is_tanker=fields.get("fleet_tag") == "Tanker"),
                 link_preview_options=NO_PREVIEW,
             )
             db.mark_vacancy_sent(tg_id, row["id"])
@@ -2464,8 +2440,9 @@ async def cb_subscribe_done(callback: CallbackQuery):
         await callback.answer(t(lang, "no_selection"), show_alert=True)
         return
     db.lock_positions(tg_id)  # с этого момента выбор нельзя изменить до следующей оплаты
+    tags_str = ", ".join(f"{tag} ({fleet})" for tag, fleet in selected)
     await callback.message.edit_text(
-        t(lang, "subscribed_summary", tags=", ".join(selected)),
+        t(lang, "subscribed_summary", tags=tags_str),
         reply_markup=after_subscribe_keyboard(lang, tg_id),
     )
     await callback.answer()
@@ -2477,19 +2454,13 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     изолирована try/except-ом на уровне вызова — сбой рассылки никак не
     должен влиять на основную публикацию, которая на этот момент уже прошла."""
     position_tag = fields.get("position_tag")
-    if not position_tag or position_tag == FALLBACK_TAG:
+    fleet_tag = fields.get("fleet_tag")
+    if not position_tag or position_tag == FALLBACK_TAG or not fleet_tag:
         return
-    is_tanker = TAG_TO_FLEET.get(position_tag) == "tanker"
-    # ищем и по новому тегу, и по старому (если он есть в таблице алиасов) —
-    # чтобы подписчики, выбравшие должность ещё до перехода на разделение по
-    # флотам, продолжали получать рассылку без необходимости пересоздавать
-    # подписку
-    tags_to_match = [position_tag]
-    if position_tag in LEGACY_TAG_ALIASES:
-        tags_to_match.append(LEGACY_TAG_ALIASES[position_tag])
-    subscriber_ids = db.get_subscribers_for_tag(tags_to_match)
+    is_tanker = fleet_tag == "Tanker"
+    subscriber_ids = db.get_subscribers_for_tag(position_tag, fleet_tag)
     print(f"[notify_subscribers] vacancy_id={vacancy_id} tag={position_tag} "
-          f"tags_to_match={tags_to_match} найдено подписчиков: {len(subscriber_ids)}")
+          f"fleet={fleet_tag} найдено подписчиков: {len(subscriber_ids)}")
     for tg_id in subscriber_ids:
         if db.was_vacancy_sent(tg_id, vacancy_id):
             continue  # уже отправляли именно эту вакансию этому человеку раньше
