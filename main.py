@@ -87,8 +87,7 @@ DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 # fleet_tag, а не суффиксом в самом теге). Источник правды для тегов
 # #Position и для матчинга в /subscribe.
 RANK_TAGS = [
-    "Master", "ChiefOfficer", "ChiefOfficerSDPO", "SecondOfficer", "SecondOfficerDPO",
-    "SecondOfficerJDPO", "ThirdOfficer", "ThirdOfficerJDPO", "JuniorOfficer", "MasterSDPO",
+    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer", "MasterSDPO",
     "DeckCadet", "SafetyOfficer", "HLO",
     "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer", "EngineCadet",
     "ETO", "Electrician", "ElectricianAssistant", "RefEngineer", "GasEngineer",
@@ -109,9 +108,12 @@ MERCHANT_TANKER_DEPARTMENTS = {
 }
 
 OFFSHORE_DEPARTMENTS = {
-    "Bridge Officers": ["MasterSDPO", "Master", "ChiefOfficerSDPO", "ChiefOfficer",
-                        "SecondOfficerDPO", "SecondOfficerJDPO", "SecondOfficer",
-                        "ThirdOfficerJDPO", "ThirdOfficer", "SafetyOfficer", "HLO"],
+    # Master — единственное исключение с отдельным DP-тегом (MasterSDPO).
+    # Chief/Second/Third Officer с пометкой SDPO/DPO/JDPO схлопываются в
+    # базовый тег (ChiefOfficer/SecondOfficer/ThirdOfficer) — отдельного
+    # DP-варианта для них НЕТ, см. правило в промпте ниже
+    "Bridge Officers": ["MasterSDPO", "Master", "ChiefOfficer",
+                        "SecondOfficer", "ThirdOfficer", "SafetyOfficer", "HLO"],
     "Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
                         "ETO", "Electrician", "ElectricianAssistant"],
     "Deck Ratings": ["AB", "OS", "Bosun", "Roustabout", "CraneOperator", "GangwayOperator",
@@ -471,86 +473,79 @@ distinct vacancy starts and ends by meaning (a new job title / new "send your CV
 usually signals a new posting), then extract fields for each one separately.
 
 For each vacancy, extract:
-- position: short job title, as written/implied in the source (human-readable, keep natural
-  wording, e.g. "Chief Engineer", "2nd Officer")
-- position_tag: map the position to EXACTLY ONE tag from this fixed list. The list contains
-  the SAME job titles repeated for three separate fleets — pick the version matching the
-  fleet the vessel belongs to, using these naming rules:
-    * Tanker fleet (vessel is any kind of tanker — vessel_tag is Tanker, CrudeOilTanker,
-      ChemicalTanker, OilProductTanker, VLGC, VLCC, LNG, or LPG): tag ends with "Tanker",
-      e.g. MasterTanker, ChiefEngineerTanker, ABTanker. Tankers also have a distinct
-      rating with no merchant/offshore equivalent: PumpmanTanker.
-    * Offshore fleet (vessel is an offshore support/construction vessel — OSV, PSV, AHTS,
-      DSV, CSV, SOV, MPSV, a rig, FPSO, jack-up, a dredger/dredging vessel (Dredger), a
-      pipe-laying vessel (Pipelay), a cable-laying vessel (CableLayer), or the posting
-      mentions DP/dynamic positioning, offshore wind, platform, subsea work): tag ends
-      with "Offshore"
-      (e.g. ChiefEngineerOffshore, BosunOffshore), EXCEPT bridge officers which use their
-      own distinct DP-specific names instead of a suffix: MasterSDPO, ChiefOfficerDPO,
-      SecondOfficerDPO, ThirdOfficerJDPO. Offshore also has specialist roles with no
-      merchant/tanker equivalent: SafetyOfficer, HLO, Roustabout, CraneOperator,
-      GangwayOperator, Rigger, Campboss, ChiefSteward, ROVPilot, ClientRepresentative,
-      OnlineSurvey, SurveyEngineer, Diver, Scaffolder, WinchOperator.
-    * Merchant fleet (everything else — general cargo, container, bulk carrier, ro-ro,
-      cruise, reefer, ferry, or vessel type not stated): tag has NO suffix, e.g. Master,
-      ChiefEngineer, Bosun, AB.
-  Full list of valid tags: {rank_tags}
-  Common rank-to-tag mappings (apply the same logic + the correct fleet suffix above to
-  anything similar that isn't listed here):
-    "Master", "Captain", "Skipper" -> Master / MasterTanker / MasterSDPO
-    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer / ChiefOfficerTanker / ChiefOfficerDPO
-    "2/O", "2nd Officer", "Second Officer", "Second Mate" -> SecondOfficer / SecondOfficerTanker / SecondOfficerDPO
-    "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer / ThirdOfficerTanker / ThirdOfficerJDPO
-    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet / DeckCadetTanker / DeckCadetOffshore
-    "C/E", "Chief Engineer" -> ChiefEngineer / ChiefEngineerTanker / ChiefEngineerOffshore
-    "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer (+ fleet suffix)
-    "3/E", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer (+ fleet suffix)
-    "4/E", "Junior Engineer", "Third Assistant Engineer" -> JuniorEngineer (+ fleet suffix)
-    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet (+ fleet suffix)
-    "Junior ETO", "Electro-Technical Officer", "Electrical Officer" -> ETO (+ fleet suffix)
-    "Ship's Electrician", "Electrical Rating" -> Electrician (+ fleet suffix)
-    "Boatswain", "Bosun's Mate" -> Bosun (+ fleet suffix)
-    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB (+ fleet suffix)
-    "OS", "Ordinary Seaman" -> OS (+ fleet suffix)
-    "Motorman", "Engine Rating" -> Motorman (+ fleet suffix)
-    "Oiler" -> Oiler (+ fleet suffix); "Wiper" -> Wiper (+ fleet suffix) — these are
-    DIFFERENT ratings, don't merge them
-    "Fitter", "Engine Fitter" -> Fitter (+ fleet suffix); "Welder" -> Welder (+ fleet suffix)
-    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook (+ fleet suffix);
-    "Night Cook" -> NightCook (+ fleet suffix)
-    "Steward" -> Steward (+ fleet suffix); "Mess Man", "Messman" -> Messman (+ fleet
-    suffix) — these are DIFFERENT roles, don't merge them; "Baker" -> Baker (+ fleet suffix)
-    "Deck Mechanic", "Deck Engineer" — a hybrid deck/engine rating common on OSVs —
-    -> ThirdEngineer (+ fleet suffix) if described as more senior/experienced, or
-    JuniorEngineer (+ fleet suffix) if junior/entry-level; do NOT use "Other" for these
-    "Ref Engineer", "Reefer Engineer" -> RefEngineer (+ fleet suffix); "Gas Engineer" ->
-    GasEngineer (+ fleet suffix) — these exist for merchant and tanker fleets, not offshore
-    "Pumpman" (tanker cargo pump rating) -> PumpmanTanker
-    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
-    between SecondOfficer and ThirdOfficer — infer from context (years of experience
-    required, COC class, whether it's described as senior/junior watch); if there is truly
-    no way to tell, default to SecondOfficer rather than Other.
+- position: short job title, human-readable, ALWAYS with normal spacing between words
+  regardless of how it was abbreviated in the source — e.g. source "2/O" or "2nd Off" or
+  "Captain" must still produce position "Second Officer" / "Master". Never output the
+  position field in CamelCase or without spaces — that format is ONLY for position_tag.
+- position_tag: map the position to EXACTLY ONE tag from this fixed list (no spaces,
+  CamelCase). The SAME tag (e.g. Master, ChiefOfficer, Bosun) is used regardless of which
+  fleet the vessel belongs to — fleet is tracked separately via vessel_tag, not baked into
+  this tag. So just pick the closest rank match, ignoring fleet entirely at this step:
+  {rank_tags}
+  Common rank-to-tag mappings (apply the same logic to anything similar not listed here):
+    "Master", "Captain", "Skipper" -> Master
+    "C/O", "Ch.Off", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer
+    "2/O", "2nd Off", "2nd Officer", "Second Officer", "Second Mate" -> SecondOfficer
+    "3/O", "3rd Off", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
+    "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
+    "C/E", "Chief Engineer" -> ChiefEngineer
+    "2/E", "2nd Eng", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
+    "3/E", "3rd Eng", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer
+    "4/E", "Junior Engineer", "Third Assistant Engineer" -> JuniorEngineer
+    "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
+    "Junior ETO", "Electro-Technical Officer", "Electrical Officer" -> ETO
+    "Ship's Electrician", "Electrical Rating" -> Electrician
+    "Electrician Assistant", "Junior Electrician" -> ElectricianAssistant (offshore only)
+    "Boatswain", "Bosun's Mate" -> Bosun
+    "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
+    "OS", "Ordinary Seaman" -> OS
+    "Motorman", "Engine Rating" -> Motorman
+    "Oiler" -> Oiler; "Wiper" -> Wiper — these are DIFFERENT ratings, don't merge them
+    "Fitter", "Engine Fitter" -> Fitter; "Welder" -> Welder
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook; "Night Cook" -> NightCook
+    "Steward", "Stewardess" -> Steward; "Mess Man", "Messman" -> Messman — DIFFERENT
+    roles, don't merge them; "Baker" -> Baker
+    "Deck Mechanic", "Deck Engineer" (hybrid deck/engine rating common on OSVs) ->
+    ThirdEngineer if senior/experienced, or JuniorEngineer if junior/entry-level; do NOT
+    use "Other" for these
+    "Ref Engineer", "Reefer Engineer" -> RefEngineer; "Gas Engineer" -> GasEngineer
+    (these two exist for merchant/tanker vessels only, not offshore)
+    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number is ambiguous between
+    SecondOfficer and ThirdOfficer — infer from context (years of experience, COC class,
+    senior/junior watch); default to SecondOfficer if truly no way to tell.
+  Offshore DP-rank special case (only relevant when vessel_tag indicates an offshore
+  vessel): if the posting mentions SDPO/DPO alongside "Master" -> tag is still MasterSDPO
+  (a distinct tag from plain Master — this is the ONE exception with its own DP tag). But
+  if SDPO/DPO/JDPO is mentioned alongside Chief/Second/Third Officer, DO NOT create a
+  separate DP tag for them — just use the plain ChiefOfficer / SecondOfficer / ThirdOfficer
+  tag (SDPO/DPO implies Chief Officer or Master context; JDPO/DPO implies Second or Third
+  Officer context, used only to help you pick WHICH base rank, not to change the tag itself).
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
-- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list:
+- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (the tag itself
+  has no spaces — CamelCase/acronym — but match against it loosely, ignoring case/spacing):
   {vessel_tags}
-  Common mappings to use as a guide:
+  Common mappings to use as a guide (apply the same CamelCase-collapsing logic to any
+  similar phrasing not listed here — e.g. "Panamax Bulk Carrier" -> PanamaxBulkCarrier):
     "crude oil tanker", "crude carrier" -> CrudeOilTanker
     "chemical tanker", "chem tanker" -> ChemicalTanker
-    "product tanker", "oil products tanker", "oil/chem tanker" -> OilProductTanker
+    "product tanker", "oil products tanker", "CPP tanker" -> CPPTanker; "DPP tanker" -> DPPTanker
     "VLGC", "very large gas carrier" -> VLGC ; "VLCC", "very large crude carrier" -> VLCC
-    "LNG carrier", "LNG tanker" -> LNG ; "LPG carrier", "LPG tanker", "gas carrier" -> LPG
-    a generic/unspecified "tanker" with no subtype stated -> Tanker
-    "general cargo", "general cargo vessel", "multi-purpose cargo" -> GeneralCargo (NOT Bulk —
-    Bulk is only for actual bulk/bulker carriers of loose bulk cargo like grain, ore, coal)
-    "tug", "tugboat", "towing vessel" -> Tug (NOT OSV — tugs are a distinct vessel type,
-    even though some also do offshore towage work)
-    "pipe lay vessel", "pipelayer", "pipe-laying vessel" -> Pipelay
-    "heavy lift vessel", "heavy-lift carrier", "semi-submersible heavy lift" -> HeavyLift
-    "OSV", "Offshore Support Vessel", "supply vessel" -> OSV
+    "LNG carrier", "LNG tanker" -> LNGCarrier ; "LPG carrier", "LPG tanker" -> LPGCarrier
+    "general cargo", "general cargo vessel", "multi-purpose cargo", "MPP", "MPV" ->
+    GeneralCargoVessel or MultipurposeVessel (NOT Bulk — bulk carriers are only for actual
+    loose bulk cargo like grain, ore, coal)
+    "tug", "tugboat", "towing vessel" -> Tug; "ASD tug" -> ASDTug (NOT PSV/OSV-type tags —
+    tugs are a distinct vessel type, even though some also do offshore towage work)
+    "pipe lay vessel", "pipelayer", "PLSV" -> PLSV
+    "heavy lift vessel", "heavy-lift carrier", "HLV" -> HLV (offshore) or HeavyLiftVessel
+    (merchant, for a cargo ship that carries heavy-lift cargo rather than installs things)
+    "PSV", "Platform Supply Vessel", "supply vessel" -> PSV; "AHTS", "Anchor Handling Tug
+    Supply" -> AHTS; "MPSV" -> MPSV; "DSV", "Diving Support Vessel" -> DSV
     "dredger", "dredging vessel", "TSHD", "trailing suction hopper dredger",
     "cutter suction dredger" -> Dredger
-  If vessel type isn't stated or nothing fits, use "Other".
+  If vessel type isn't stated or nothing in the list fits, use "Other" (this defaults the
+  vacancy to the Merchant fleet — the safest fallback when the vessel type is unclear).
 - region: country/region/location, or null
 - nationality: nationality/citizenship requirement if stated, or null
 - date: joining/start date, or null
