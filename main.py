@@ -1023,6 +1023,7 @@ async def cmd_start(message: Message, command: CommandObject):
             "/unlockpositions [@ник или id] — разблокировать выбор, чтобы человек сам перевыбрал должности в /subscribe\n"
             "/lockpositions [@ник или id] — зафиксировать текущий выбор обратно\n"
             "/unlockpositionsall — разблокировать выбор должностей ВСЕМ подписчикам сразу\n"
+            "/revokeallpositions — снять ВСЕ должности у ВСЕХ подписчиков (нужно /revokeallpositions confirm)\n"
             "/getemails — платная подборка email за неделю (доступна любому, не только вам)\n"
             "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не картой\n"
             "/extendall [дней] — продлить доступ ВСЕМ подписчикам бесплатно (например, /extendall 4)\n"
@@ -2191,6 +2192,36 @@ async def cmd_unlock_positions_all(message: Message, command: CommandObject):
     await status_msg.edit_text(
         f"✅ Разблокировал выбор должностей {len(people)} подписчикам "
         f"(уведомление доставлено {notified} из {len(people)})."
+    )
+
+
+@router.message(Command("revokeallpositions"))
+async def cmd_revoke_all_positions(message: Message, command: CommandObject):
+    """Полностью снимает ВСЕ выбранные должности у ВСЕХ подписчиков сразу
+    (во всех трёх флотах) — например, после смены структуры должностей,
+    чтобы все выбрали заново с нуля. НЕОБРАТИМО (история backfill_sent тоже
+    стирается — при повторном выборе той же должности бэкфилл придёт заново).
+    Требует подтверждения: сначала /revokeallpositions, затем
+    /revokeallpositions confirm."""
+    if not admin_only(message.from_user.id):
+        return
+    people = db.get_subscribers_list()
+    if not people:
+        await message.answer("Подписчиков пока нет.")
+        return
+    if (command.args or "").strip().lower() != "confirm":
+        await message.answer(
+            f"⚠️ Это снимет ВСЕ выбранные должности у ВСЕХ {len(people)} подписчиков "
+            f"(во всех флотах) без возможности отменить.\n\n"
+            f"Чтобы подтвердить: /revokeallpositions confirm"
+        )
+        return
+    status_msg = await message.answer(f"⏳ Снимаю должности у {len(people)} подписчиков...")
+    for p in people:
+        db.clear_subscriber_positions(p["tg_id"])
+        db.unlock_positions(p["tg_id"])
+    await status_msg.edit_text(
+        f"✅ Снял все должности у {len(people)} подписчиков. Они смогут выбрать заново через /subscribe."
     )
 
 
