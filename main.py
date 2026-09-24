@@ -134,6 +134,17 @@ FLEETS = {
 
 MAX_POSITIONS_PER_FLEET = 2
 
+# Односторонний альяс матчинга: вакансия с этим тегом ДОПОЛНИТЕЛЬНО уходит
+# подписчикам базового тега (DP-вакансия на Master — это всё ещё вакансия
+# на Master, просто с доп. требованием). Обратного направления нет — тот,
+# кто specifically подписался на MasterSDPO, не должен получать вообще
+# любые Master-вакансии, только DP. Только офшор — у Chief/Second/Third
+# Officer отдельного DP-тега больше нет вообще (см. промпт), обе роли уже
+# схлопнуты в один тег на этапе разбора текста.
+TAG_MATCH_ALIASES = {
+    "MasterSDPO": ["Master"],
+}
+
 # Типы судов → флот. Флот вакансии определяется программно по этому словарю
 # (а не тем, что попросили угадать у Claude) — так надёжнее: одна ошибка в
 # классификации судна не разваливает всю логику подписок. Claude выбирает
@@ -513,6 +524,9 @@ For each vacancy, extract:
     "OOW" (Officer of the Watch) or a bare "Mate" with no rank number is ambiguous between
     SecondOfficer and ThirdOfficer — infer from context (years of experience, COC class,
     senior/junior watch); default to SecondOfficer if truly no way to tell.
+    "EOOW" (Engineer Officer of the Watch) or a bare "Engineer" with no rank number is
+    ambiguous between SecondEngineer and ThirdEngineer — infer from context the same way;
+    default to ThirdEngineer if truly no way to tell.
   Offshore DP-rank special case (only relevant when vessel_tag indicates an offshore
   vessel): if the posting mentions SDPO/DPO alongside "Master" -> tag is still MasterSDPO
   (a distinct tag from plain Master — this is the ONE exception with its own DP tag). But
@@ -2431,7 +2445,12 @@ async def cb_subscribe_position(callback: CallbackQuery):
         # выбрал снова) — не шлём повторно, чтобы не открывать дыру для
         # накрутки вакансий через снятие/повторный выбор по кругу
         return
-    backfill = db.get_recent_published_by_tag(position_tag, fleet_tag, days=BACKFILL_DAYS)
+    backfill = list(db.get_recent_published_by_tag(position_tag, fleet_tag, days=BACKFILL_DAYS))
+    # обратное направление альяса: подписался на Master — получи в бэкфилле
+    # и недавние MasterSDPO-вакансии тоже (см. TAG_MATCH_ALIASES)
+    for alias_tag, targets in TAG_MATCH_ALIASES.items():
+        if position_tag in targets:
+            backfill += list(db.get_recent_published_by_tag(alias_tag, fleet_tag, days=BACKFILL_DAYS))
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
@@ -2484,7 +2503,9 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     if not position_tag or position_tag == FALLBACK_TAG or not fleet_tag:
         return
     is_tanker = fleet_tag == "Tanker"
-    subscriber_ids = db.get_subscribers_for_tag(position_tag, fleet_tag)
+    subscriber_ids = set(db.get_subscribers_for_tag(position_tag, fleet_tag))
+    for alias_tag in TAG_MATCH_ALIASES.get(position_tag, []):
+        subscriber_ids.update(db.get_subscribers_for_tag(alias_tag, fleet_tag))
     print(f"[notify_subscribers] vacancy_id={vacancy_id} tag={position_tag} "
           f"fleet={fleet_tag} найдено подписчиков: {len(subscriber_ids)}")
     for tg_id in subscriber_ids:
