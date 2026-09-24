@@ -49,14 +49,11 @@ CHANNEL_BANNER_PATH = os.path.join(os.path.dirname(__file__), "static", "assets"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
-# Отдельный канал для танкерных вакансий — публикуется ТУДА ЖЕ, ПЛЮС в
-# основной канал (не вместо). Пока отдельный канал ещё не завели/он пустой —
-# оставляем переменные пустыми в Variables, тогда код сам берёт CHANNEL_ID/
-# CHANNEL_USERNAME (то есть постит второй раз в тот же основной канал, как
-# временная заглушка) — как только заведёте настоящий канал танкеров,
-# впишите его username в TANKER_CHANNEL_USERNAME и всё заработает как надо
-# без изменений в коде.
-TANKER_CHANNEL_USERNAME = os.getenv("TANKER_CHANNEL_USERNAME", CHANNEL_USERNAME)
+# Отдельный канал для танкеров и газовозов (LNG/LPG) — публикуется ТУДА
+# ВМЕСТО основного канала, не вместе с ним: вакансия либо танкерная/газовая,
+# либо нет, флот у вакансии всегда ровно один (fleet_tag == "Tanker" уже
+# включает LNG/LPG — см. TANKER_VESSEL_TAGS).
+TANKER_CHANNEL_USERNAME = os.getenv("TANKER_CHANNEL_USERNAME", "tankerjobatsea")
 TANKER_CHANNEL_ID = f"@{TANKER_CHANNEL_USERNAME}"
 TANKER_CHANNEL_LINK = os.getenv("TANKER_CHANNEL_LINK", f"https://t.me/{TANKER_CHANNEL_USERNAME}")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
@@ -951,23 +948,14 @@ async def do_publish(bot: Bot, vacancy_id: int):
     text = render_template(fields)  # полный текст — идёт в личные рассылки подписчикам
     caption = render_caption(fields)  # ужатая версия под лимит подписи к фото (1024 симв.)
 
-    # Танкерная вакансия — смотрим на сохранённый fleet_tag (вычислен по
-    # типу судна при разборе, см. vessel_tag_to_fleet) — публикуется И в
-    # основной канал, И (дополнительно) в канал танкерных вакансий, с
-    # отдельной кнопкой под постом в обоих местах.
+    # Флот вакансии определяет, в какой канал она идёт — ровно в один:
+    # Tanker (включая LNG/LPG-газовозы) -> канал танкеров, всё остальное
+    # (Merchant + Offshore) -> основной канал. Никакого дублирования.
     is_tanker = fields.get("fleet_tag") == "Tanker"
+    target_channel = TANKER_CHANNEL_ID if is_tanker else CHANNEL_ID
 
-    message_id = await _publish_to_channel(bot, CHANNEL_ID, text, caption, vacancy_id, is_tanker)
+    message_id = await _publish_to_channel(bot, target_channel, text, caption, vacancy_id, is_tanker)
     db.set_status(vacancy_id, "published", message_id)
-
-    if is_tanker and TANKER_CHANNEL_ID != CHANNEL_ID:
-        # кросс-постинг в отдельный канал — сейчас, пока TANKER_CHANNEL_USERNAME
-        # не задан в Variables, TANKER_CHANNEL_ID равен CHANNEL_ID и это
-        # условие просто не выполняется (не постим второй раз в тот же канал)
-        try:
-            await _publish_to_channel(bot, TANKER_CHANNEL_ID, text, caption, vacancy_id, is_tanker)
-        except Exception as e:
-            print(f"[do_publish] Не удалось опубликовать в канал танкеров: {e}")
 
     # публикация в канал уже состоялась и подтверждена выше — рассылка
     # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
