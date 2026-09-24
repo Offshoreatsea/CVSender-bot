@@ -919,10 +919,19 @@ def next_digest_slot() -> datetime:
 
 
 async def _publish_to_channel(bot: Bot, chat_id: str, text: str, caption: str,
-                               vacancy_id: int, is_tanker: bool) -> int:
-    """Публикует один пост (фото+подпись, либо просто текст, если баннера
-    нет/не открылся) в указанный канал. Общая логика для основного канала и
-    для канала танкерных вакансий — чтобы не дублировать try/except дважды."""
+                               vacancy_id: int, is_tanker: bool, bare: bool = False) -> int:
+    """Публикует один пост в указанный канал. bare=True — только чистый
+    текст вакансии, без баннера и без кнопки на сам канал/лого (используется
+    для канала танкеров — там пост и так уже лежит в нужном канале, баннер
+    и ссылка на группу там не нужны, в отличие от основного канала)."""
+    if bare:
+        sent = await bot.send_message(
+            chat_id=chat_id, text=text,
+            reply_markup=channel_keyboard(vacancy_id, is_tanker=False, include_menu=False),
+            link_preview_options=NO_PREVIEW,
+        )
+        return sent.message_id
+
     keyboard = channel_keyboard(vacancy_id, is_tanker=is_tanker, include_menu=False)
     if os.path.isfile(CHANNEL_BANNER_PATH):
         try:
@@ -954,7 +963,9 @@ async def do_publish(bot: Bot, vacancy_id: int):
     is_tanker = fields.get("fleet_tag") == "Tanker"
     target_channel = TANKER_CHANNEL_ID if is_tanker else CHANNEL_ID
 
-    message_id = await _publish_to_channel(bot, target_channel, text, caption, vacancy_id, is_tanker)
+    message_id = await _publish_to_channel(
+        bot, target_channel, text, caption, vacancy_id, is_tanker, bare=is_tanker
+    )
     db.set_status(vacancy_id, "published", message_id)
 
     # публикация в канал уже состоялась и подтверждена выше — рассылка
