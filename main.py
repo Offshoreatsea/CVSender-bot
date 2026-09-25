@@ -677,7 +677,8 @@ def ai_parse_batch(raw: str) -> list[dict]:
     return data
 
 
-def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None) -> str:
+def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None,
+                     show_channel_link: bool = True) -> str:
     def val(key):
         v = fields.get(key)
         return v if v else None
@@ -736,8 +737,11 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
         parts.append("")
         parts.append(fields["hashtags"])
 
-    parts.append("")
-    parts.append(f"🔗 {CHANNEL_LINK}")
+    if show_channel_link:
+        # в канал танкеров этот хвост не добавляем — ссылка вела бы на
+        # ОСНОВНОЙ канал, что бессмысленно внутри другого канала
+        parts.append("")
+        parts.append(f"🔗 {CHANNEL_LINK}")
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -962,9 +966,12 @@ async def do_publish(bot: Bot, vacancy_id: int):
     # (Merchant + Offshore) -> основной канал. Никакого дублирования.
     is_tanker = fields.get("fleet_tag") == "Tanker"
     target_channel = TANKER_CHANNEL_ID if is_tanker else CHANNEL_ID
+    # для канала танкеров — отдельный текст без ссылки на основной канал
+    # в конце (она вела бы не туда, где сам пост и лежит)
+    publish_text = render_template(fields, show_channel_link=not is_tanker) if is_tanker else text
 
     message_id = await _publish_to_channel(
-        bot, target_channel, text, caption, vacancy_id, is_tanker, bare=is_tanker
+        bot, target_channel, publish_text, caption, vacancy_id, is_tanker, bare=is_tanker
     )
     db.set_status(vacancy_id, "published", message_id)
 
