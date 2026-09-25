@@ -238,6 +238,34 @@ def init_db():
             last_sent_date TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS external_jobs_seen (
+            source TEXT,
+            external_id TEXT,
+            seen_at TEXT,
+            PRIMARY KEY (source, external_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def is_external_job_seen(source: str, external_id: str) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM external_jobs_seen WHERE source = ? AND external_id = ?",
+        (source, external_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_external_job_seen(source: str, external_id: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO external_jobs_seen (source, external_id, seen_at) VALUES (?, ?, ?)",
+        (source, external_id, datetime.now().isoformat()),
+    )
     conn.commit()
     conn.close()
 
@@ -912,6 +940,22 @@ def get_recent_published_by_tag(position_tag: str, fleet_tag: str, days: int = 7
            WHERE status = 'published' AND position_tag = ? AND fleet_tag = ? AND created_at > ?
            ORDER BY created_at ASC""",
         (position_tag, fleet_tag, cutoff),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_recent_published(days: int = 7):
+    """Все опубликованные вакансии за `days` суток, от старых к новым — без
+    фильтра по должности/флоту (для email_apply.py: фильтрация по клиенту
+    делается в коде через ranks.matches(), т.к. там нужна ещё и семья
+    должностей, а не только точный тег)."""
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT * FROM vacancies WHERE status = 'published' AND created_at > ?
+           ORDER BY created_at ASC""",
+        (cutoff,),
     ).fetchall()
     conn.close()
     return rows

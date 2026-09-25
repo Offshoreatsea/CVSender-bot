@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 
 import anthropic
+import httpx
 import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -31,6 +32,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import email_apply
+import ranks
 import webapp
 
 load_dotenv()
@@ -979,6 +982,12 @@ async def do_publish(bot: Bot, vacancy_id: int):
         await notify_subscribers(bot, vacancy_id, fields)
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
+
+    # черновики откликов по email с почты клиентов — тоже изолированно
+    try:
+        await email_apply.propose_for_vacancy(bot, vacancy_id)
+    except Exception as e:
+        print(f"[do_publish] Черновики email-откликов не созданы: {e}")
 
 
 @router.message(Command("start"))
@@ -2723,14 +2732,131 @@ async def ad_scheduler_worker(bot: Bot):
         await asyncio.sleep(60)
 
 
+CREWLINK_ENABLED = os.getenv("CREWLINK_ENABLED", "true").lower() == "true"
+CREWLINK_INTERVAL_MIN = int(os.getenv("CREWLINK_INTERVAL_MIN", "45"))
+CREWLINK_JOBS_URL = "https://crewlink.me/jobs"
+CREWLINK_JOB_ID_RE = re.compile(
+    r"/jobs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
+def strip_html_to_text(html: str) -> str:
+    """Грубая, но достаточная для наших целей очистка HTML в читаемый текст —
+    без внешних библиотек (BeautifulSoup и т.п. в зависимостях нет). Итоговый
+    текст идёт в тот же ai_parse_batch, что разбирает вакансии, присланные
+    админом руками, — не нужна идеальная структура, только читаемый текст."""
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</p>|</div>|</li>|</h[1-6]>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"<[^>]+>", " ", html)
+    html = (html.replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
+    html = re.sub(r"[ \t]+", " ", html)
+    html = re.sub(r"\n\s*\n+", "\n", html)
+    return html.strip()
+
+
+async def crewlink_scraper_worker(bot: Bot):
+    """Раз в CREWLINK_INTERVAL_MIN минут проверяет crewlink.me/jobs на новые
+    вакансии, разбирает их через тот же ai_parse_batch, что и обычные
+    вакансии от админа, и публикует по тем же правилам (авто/черновик,
+    дедупликация) — админ видит результат в личке, как если бы сам вставил
+    текст. Помечает каждую вакансию как "уже виденную" по её id из ссылки,
+    чтобы не разбирать повторно при следующем проходе."""
+    if not CREWLINK_ENABLED:
+        print("[crewlink_scraper_worker] Выключено через CREWLINK_ENABLED=false")
+        return
+    await asyncio.sleep(30)  # даём боту полностью подняться перед первым проходом
+    async with httpx.AsyncClient(
+        timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; CVSenderJobBot/1.0)"}
+    ) as client:
+        while True:
+            try:
+                resp = await client.get(CREWLINK_JOBS_URL)
+                resp.raise_for_status()
+                job_ids = sorted(set(CREWLINK_JOB_ID_RE.findall(resp.text)))
+                new_ids = [j for j in job_ids if not db.is_external_job_seen("crewlink", j)]
+                print(f"[crewlink_scraper_worker] Найдено {len(job_ids)} вакансий на странице, "
+                      f"новых: {len(new_ids)}")
+                auto = is_auto_publish()
+                for job_id in new_ids:
+                    try:
+                        job_url = f"https://crewlink.me/jobs/{job_id}"
+                        job_resp = await client.get(job_url)
+                        job_resp.raise_for_status()
+                        raw_text = strip_html_to_text(job_resp.text)[:6000]
+                        for fields in ai_parse_batch(raw_text):
+                            key = dedup_key_for(fields)
+                            dup = db.find_recent_duplicate(key)
+                            vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
+                            text = render_template(fields)
+                            source_note = f"\n\n🌐 Источник: {job_url}"
+                            if dup:
+                                for admin_id in ADMIN_IDS:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"⚠️ CrewLink: похоже, уже публиковалось "
+                                            f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}{source_note}",
+                                            reply_markup=duplicate_keyboard(vacancy_id),
+                                            link_preview_options=NO_PREVIEW,
+                                        )
+                                    except TelegramAPIError:
+                                        pass
+                                continue
+                            if auto:
+                                await do_publish(bot, vacancy_id)
+                                for admin_id in ADMIN_IDS:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"✅ CrewLink: опубликовано автоматически{source_note}\n\n{text}",
+                                            link_preview_options=NO_PREVIEW,
+                                        )
+                                    except TelegramAPIError:
+                                        pass
+                            else:
+                                for admin_id in ADMIN_IDS:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"🌐 Новая вакансия с CrewLink:{source_note}\n\n{text}",
+                                            reply_markup=draft_keyboard(vacancy_id),
+                                            link_preview_options=NO_PREVIEW,
+                                        )
+                                    except TelegramAPIError:
+                                        pass
+                        db.mark_external_job_seen("crewlink", job_id)
+                        await asyncio.sleep(2)  # не долбим сайт подряд без пауз
+                    except Exception as e:
+                        print(f"[crewlink_scraper_worker] Ошибка на вакансии {job_id}: {e}")
+                        # НЕ помечаем как seen — попробуем ещё раз в следующий проход
+            except Exception as e:
+                print(f"[crewlink_scraper_worker] Ошибка при обходе списка вакансий: {e}")
+            await asyncio.sleep(CREWLINK_INTERVAL_MIN * 60)
+
+
 async def main():
     db.init_db()
+    email_apply.init_tables()
+    # теги для модуля откликов по email — "Должность|Флот" для каждой
+    # существующей комбинации (та же структура, что и в /subscribe), метки
+    # берутся из POSITION_GROUPS внутри самого email_apply.py
+    mail_valid_tags = [
+        f"{tag}|{fleet_key.capitalize()}"
+        for fleet_key, fleet in FLEETS.items()
+        for tags in fleet["departments"].values()
+        for tag in tags
+    ]
+    email_apply.setup(ADMIN_IDS, claude, mail_valid_tags, {})
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(email_apply.router)  # раньше основного: его пошаговые диалоги должны ловить текст первыми
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(ad_scheduler_worker(bot))
+    asyncio.create_task(crewlink_scraper_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
