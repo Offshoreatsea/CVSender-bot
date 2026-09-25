@@ -925,14 +925,11 @@ def next_digest_slot() -> datetime:
 async def _publish_to_channel(bot: Bot, chat_id: str, text: str, caption: str,
                                vacancy_id: int, is_tanker: bool, bare: bool = False) -> int:
     """Публикует один пост в указанный канал. bare=True — только чистый
-    текст вакансии, без баннера и без кнопки на сам канал/лого (используется
-    для канала танкеров — там пост и так уже лежит в нужном канале, баннер
-    и ссылка на группу там не нужны, в отличие от основного канала)."""
+    текст вакансии, вообще без кнопок, баннера и ссылок на другие каналы
+    (используется для канала танкеров)."""
     if bare:
         sent = await bot.send_message(
-            chat_id=chat_id, text=text,
-            reply_markup=channel_keyboard(vacancy_id, is_tanker=False, include_menu=False),
-            link_preview_options=NO_PREVIEW,
+            chat_id=chat_id, text=text, link_preview_options=NO_PREVIEW,
         )
         return sent.message_id
 
@@ -1295,9 +1292,22 @@ async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
     contacts = db.list_contacts_since(7)
     emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
     if emails:
-        await bot.send_message(
-            tg_id, t(lang, "digest_delivered", count=len(emails)) + "\n\n" + "\n".join(emails)
-        )
+        # Telegram режет сообщения длиннее ~4096 символов — при большом
+        # списке email одним сообщением не влезет, поэтому шлём заголовок
+        # отдельно, а сами адреса чанками по TELEGRAM_MSG_LIMIT символов
+        await bot.send_message(tg_id, t(lang, "digest_delivered", count=len(emails)))
+        TELEGRAM_MSG_LIMIT = 3500  # с запасом от жёсткого лимита в 4096
+        chunk: list[str] = []
+        chunk_len = 0
+        for email in emails:
+            if chunk_len + len(email) + 1 > TELEGRAM_MSG_LIMIT and chunk:
+                await bot.send_message(tg_id, "\n".join(chunk))
+                await asyncio.sleep(0.2)
+                chunk, chunk_len = [], 0
+            chunk.append(email)
+            chunk_len += len(email) + 1
+        if chunk:
+            await bot.send_message(tg_id, "\n".join(chunk))
     else:
         await bot.send_message(tg_id, t(lang, "digest_empty"))
 
