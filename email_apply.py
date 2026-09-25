@@ -10,7 +10,8 @@
   3. Админ жмёт ✅ Send — письмо уходит с почты самого клиента (SMTP).
      Ответ работодателя придёт прямо клиенту в его ящик.
 
-Защита: одному HR — одно CV от клиента за всё время, не больше MAIL_DAILY_LIMIT (100)
+Защита: одному HR — одно CV от клиента не чаще MAIL_HR_COOLDOWN_HOURS (по умолчанию раз в
+сутки), не больше MAIL_DAILY_LIMIT (100)
 писем в день на клиента, между письмами с одного ящика пауза ~MAIL_SEND_INTERVAL сек.
 """
 import asyncio
@@ -260,10 +261,30 @@ def app_exists(client_id: int, vacancy_id: int) -> bool:
                    (client_id, vacancy_id), one=True))
 
 
+MAIL_HR_COOLDOWN_HOURS = int(os.getenv("MAIL_HR_COOLDOWN_HOURS", "24"))  # одному HR — одно CV не чаще, чем раз в столько часов
+
+
 def already_applied_to(client_id: int, to_email: str, exclude_app_id: int | None = None,
                        statuses=("draft", "sending", "sent")) -> bool:
-    """Одному HR — одно CV от клиента за всё время (плюс не плодим черновики на тот же адрес)."""
+    """Одному HR — одно CV от клиента не чаще MAIL_HR_COOLDOWN_HOURS (по умолчанию раз в
+    сутки). Черновик/отправку в процессе (draft/sending) не дублируем НЕЗАВИСИМО от времени —
+    это просто защита от двух параллельных писем на один и тот же адрес одновременно."""
     marks = ",".join("?" * len(statuses))
+    if "sent" in statuses:
+        # для "sent" — только за последние MAIL_HR_COOLDOWN_HOURS часов; для
+        # draft/sending время не ограничиваем (см. докстринг)
+        cutoff = (datetime.now() - timedelta(hours=MAIL_HR_COOLDOWN_HOURS)).isoformat()
+        other = [s for s in statuses if s != "sent"]
+        other_marks = ",".join("?" * len(other)) if other else None
+        clause = f"(status = 'sent' AND sent_at > ?)"
+        params = [client_id, to_email, cutoff]
+        if other:
+            clause += f" OR status IN ({other_marks})"
+            params += list(other)
+        return bool(_q(
+            f"""SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
+                AND ({clause}) AND id != ?""",
+            (*params, exclude_app_id or -1), one=True))
     return bool(_q(
         f"""SELECT 1 FROM mail_applications WHERE client_id = ? AND lower(to_email) = lower(?)
             AND status IN ({marks}) AND id != ?""",
@@ -727,7 +748,7 @@ async def backfill_client(bot: Bot, client_id: int, days: int = MAIL_BACKFILL_DA
     await _report_batch(bot, client, f"вакансии за {days} дн. по его должностям ({len(rows)} шт.)", app_ids)
 
 
-async def blast_client(bot: Bot, client_id: int, days: int = 7):
+async def blast_client(bot: Bot, client_id: int, days: int = 3):
     """Рассылка CV клиента по всем HR-адресам из вакансий за `days` дней, независимо от должности."""
     client = get_client(client_id)
     if not client:
@@ -1349,13 +1370,13 @@ async def cmd_mail_help(message: Message):
         "/clientoff ID · /clienton ID — пауза/включить\n"
         "/delclient ID — удалить\n"
         "/testmail ID — тестовое письмо клиенту на его же почту\n"
-        "/blast ID [дней] — разослать CV клиента по всем HR из вакансий за неделю (любые должности)\n"
+        "/blast ID [дней 1-5] — разослать CV клиента по всем HR из вакансий за последние дни (любые должности)\n"
         "/drafts ID — черновики клиента, ждущие отправки\n"
         "/sendall ID — отправить все черновики клиента\n"
         "/applyto VACANCY_ID [CLIENT_ID] — отклик на уже опубликованную вакансию\n"
         "/applyto last [CLIENT_ID] — на последнюю опубликованную\n"
         "/mailsent — последние отправки\n\n"
-        f"Правила: одному HR — одно CV от клиента за всё время; до {MAIL_DAILY_LIMIT} писем в день; "
+        f"Правила: одному HR — одно CV от клиента раз в {MAIL_HR_COOLDOWN_HOURS} ч.; до {MAIL_DAILY_LIMIT} писем в день; "
         "пауза между письмами 1–4 мин. (настраивается в /mail → клиент → ⏱); cover letter каждый раз слегка перефразируется."
     )
 
@@ -1675,10 +1696,13 @@ async def cmd_blast(message: Message, command: CommandObject):
     parts = (command.args or "").split()
     client = get_client(int(parts[0])) if parts and parts[0].isdigit() else None
     if not client:
-        return await message.answer("Формат: /blast ID [дней] — по умолчанию 7")
-    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+        return await message.answer("Формат: /blast ID [дней 1-5] — по умолчанию 3")
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 3
     text, kb = blast_prompt(client, days)
     await message.answer(text, reply_markup=kb)
+
+
+BLAST_DAY_CHOICES = [1, 2, 3, 4, 5]
 
 
 def blast_prompt(client, days: int):
@@ -1692,9 +1716,8 @@ def blast_prompt(client, days: int):
             f"Тема и письмо — по его шаблону, вместо {{position}} подставятся его должности.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🚀 Разослать ({n})", callback_data=f"ea_blast:{client['id']}:{days}")],
-        [InlineKeyboardButton(text="7 дней", callback_data=f"m:blast:{client['id']}:7"),
-         InlineKeyboardButton(text="14 дней", callback_data=f"m:blast:{client['id']}:14"),
-         InlineKeyboardButton(text="30 дней", callback_data=f"m:blast:{client['id']}:30")],
+        [InlineKeyboardButton(text=("✅ " if d == days else "") + f"{d} дн.",
+                              callback_data=f"m:blast:{client['id']}:{d}") for d in BLAST_DAY_CHOICES],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"m:c:{client['id']}")],
     ])
     return text, kb
@@ -1847,7 +1870,7 @@ def client_view(client):
     cid = client["id"]
     b = lambda t, d: InlineKeyboardButton(text=t, callback_data=d)
     rows = [
-        [b("🚀 Разослать по базе (7 дн.)", f"m:blast:{cid}:7")],
+        [b("🚀 Разослать по базе (3 дн.)", f"m:blast:{cid}:3")],
         [b(f"🔁 Отклик за {MAIL_BACKFILL_DAYS} дн. по должностям", f"m:bf:{cid}")],
     ]
     if cc["draft"]:
@@ -1883,9 +1906,9 @@ HELP_TEXT = (
     "без уточнения → 3rd Engineer и т.п.) уже разбираются на этапе публикации "
     "вакансии — здесь дополнительно ничего додумывать не нужно.\n"
     "• Остальные должности — точное совпадение тега и флота.\n\n"
-    "<b>3. Разослать по базе</b> — 🚀 в карточке клиента: CV уходит всем HR из вакансий за 7/14/30 дн. "
+    "<b>3. Разослать по базе</b> — 🚀 в карточке клиента: CV уходит всем HR из вакансий за 1-5 дн. "
     "(любые должности), кому ещё не отправляли.\n\n"
-    "<b>Правила:</b> одному HR — одно CV от клиента навсегда · до "
+    f"<b>Правила:</b> одному HR — одно CV от клиента раз в {MAIL_HR_COOLDOWN_HOURS} ч. · до "
     f"{MAIL_DAILY_LIMIT} писем в день · пауза между письмами 1–4 мин. (⏱ в карточке клиента) · "
     "cover letter каждый раз слегка перефразируется.\n\n"
     "Ответы работодателей приходят клиенту на его почту."
