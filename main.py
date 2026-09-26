@@ -2764,7 +2764,22 @@ def strip_html_to_text(html: str) -> str:
                 .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
     html = re.sub(r"[ \t]+", " ", html)
     html = re.sub(r"\n\s*\n+", "\n", html)
-    return html.strip()
+    text = html.strip()
+
+    # обрезаем собственную рекламу CrewLink в подвале страницы (одинаковая на
+    # каждой вакансии, не относится к самой вакансии) — всё, что после неё,
+    # тоже не нужно
+    cutoff = re.search(r"CrewLink\s*[–-]\s*Joburi Maritime", text, flags=re.IGNORECASE)
+    if cutoff:
+        text = text[:cutoff.start()].strip()
+
+    # убираем ссылки — целиком http(s)-адреса и голые www.-адреса, а не всю
+    # строку целиком (в строке рядом может быть полезный текст, например email)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\bwww\.\S+", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
 
 
 async def crewlink_scraper_worker(bot: Bot):

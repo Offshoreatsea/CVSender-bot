@@ -1060,17 +1060,63 @@ def _position_groups() -> list[tuple[str, list[tuple[str, str]]]]:
     return [(n, items) for n, items in groups if items]
 
 
-def positions_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+def _display_fleets() -> list[str]:
+    """Верхний уровень навигации — группы департаментов из POSITION_GROUPS,
+    схлопнутые по префиксу до "⬅️ Готово" ('⚓ Торговый', '🛢 Танкера', ...).
+    Плоский список из ~97 должностей одним экраном упирается в лимит
+    Telegram на число кнопок в клавиатуре (100) — из-за этого пропадала
+    кнопка «Готово». Поэтому показываем сначала флот, потом департамент,
+    потом уже сами должности — на каждом экране мало кнопок."""
+    seen: list[str] = []
+    for name, _ in _position_groups():
+        prefix = name.split(" · ", 1)[0]
+        if prefix not in seen:
+            seen.append(prefix)
+    return seen
+
+
+def _depts_for_fleet(fleet_idx: int) -> list[tuple[str, list[tuple[str, str]]]]:
+    prefix = _display_fleets()[fleet_idx]
+    return [(name, items) for name, items in _position_groups() if name.split(" · ", 1)[0] == prefix]
+
+
+def fleet_picker_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
     rows = []
-    for name, items in _position_groups():
-        rows.append([InlineKeyboardButton(text=f"— {name} —", callback_data="eahdr")])
-        buttons = [
-            InlineKeyboardButton(text=("✅ " if tag in selected else "") + label, callback_data=f"eapos:{tag}")
-            for tag, label in items
-        ]
-        rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    for i, prefix in enumerate(_display_fleets()):
+        count = sum(1 for _, items in _depts_for_fleet(i) for t, _ in items if t in selected)
+        label = f"{prefix} ({count})" if count else prefix
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"eafleet:{i}")])
     rows.append([InlineKeyboardButton(text=f"Готово ✔️ ({len(selected)})", callback_data="eapos_done")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dept_picker_keyboard(fleet_idx: int, selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, (name, items) in enumerate(_depts_for_fleet(fleet_idx)):
+        short = name.split(" · ", 1)[1] if " · " in name else name
+        count = sum(1 for t, _ in items if t in selected)
+        label = f"{short} ({count})" if count else short
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"eadept:{fleet_idx}:{i}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Флоты", callback_data="eafleetback")])
+    rows.append([InlineKeyboardButton(text=f"Готово ✔️ ({len(selected)})", callback_data="eapos_done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dept_positions_keyboard(fleet_idx: int, dept_idx: int, selected: list[str]) -> InlineKeyboardMarkup:
+    _, items = _depts_for_fleet(fleet_idx)[dept_idx]
+    rows = []
+    buttons = [
+        InlineKeyboardButton(text=("✅ " if tag in selected else "") + label, callback_data=f"eapos:{tag}")
+        for tag, label in items
+    ]
+    rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="⬅️ Департаменты", callback_data=f"eadeptback:{fleet_idx}")])
+    rows.append([InlineKeyboardButton(text=f"Готово ✔️ ({len(selected)})", callback_data="eapos_done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# для обратной совместимости — верхний уровень навигации теперь fleet_picker_keyboard
+positions_keyboard = fleet_picker_keyboard
 
 
 def _pos_label(tag: str) -> str:
@@ -1166,6 +1212,45 @@ async def ac_positions(message: Message, state: FSMContext):
     await message.answer("5/9. Телефон/WhatsApp для подписи письма (или «-», если не нужен):")
 
 
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data.startswith("eafleet:"))
+async def cb_fleet_pick(callback: CallbackQuery, state: FSMContext):
+    fleet_idx = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    sel = data.get("sel") or []
+    await state.update_data(cur_fleet=fleet_idx)
+    await callback.message.edit_reply_markup(reply_markup=dept_picker_keyboard(fleet_idx, sel))
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data == "eafleetback")
+async def cb_fleet_back(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sel = data.get("sel") or []
+    await callback.message.edit_reply_markup(reply_markup=fleet_picker_keyboard(sel))
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data.startswith("eadept:"))
+async def cb_dept_pick(callback: CallbackQuery, state: FSMContext):
+    _, fleet_idx, dept_idx = callback.data.split(":")
+    data = await state.get_data()
+    sel = data.get("sel") or []
+    await state.update_data(cur_fleet=int(fleet_idx), cur_dept=int(dept_idx))
+    await callback.message.edit_reply_markup(
+        reply_markup=dept_positions_keyboard(int(fleet_idx), int(dept_idx), sel)
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data.startswith("eadeptback:"))
+async def cb_dept_back(callback: CallbackQuery, state: FSMContext):
+    fleet_idx = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    sel = data.get("sel") or []
+    await callback.message.edit_reply_markup(reply_markup=dept_picker_keyboard(fleet_idx, sel))
+    await callback.answer()
+
+
 @router.callback_query(StateFilter(AddClient.positions, ClientPosEdit.pick), F.data.startswith("eapos:"))
 async def cb_pos_toggle(callback: CallbackQuery, state: FSMContext):
     tag = callback.data.split(":", 1)[1]
@@ -1173,7 +1258,12 @@ async def cb_pos_toggle(callback: CallbackQuery, state: FSMContext):
     sel = list(data.get("sel") or [])
     sel.remove(tag) if tag in sel else sel.append(tag)
     await state.update_data(sel=sel)
-    await callback.message.edit_reply_markup(reply_markup=positions_keyboard(sel))
+    fleet_idx, dept_idx = data.get("cur_fleet"), data.get("cur_dept")
+    if fleet_idx is not None and dept_idx is not None:
+        markup = dept_positions_keyboard(fleet_idx, dept_idx, sel)
+    else:
+        markup = fleet_picker_keyboard(sel)  # подстраховка — не должно случаться в норме
+    await callback.message.edit_reply_markup(reply_markup=markup)
     await callback.answer()
 
 
@@ -1204,7 +1294,7 @@ async def cb_pos_header(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("eapos"))
+@router.callback_query(F.data.startswith(("eapos", "eafleet", "eadept")))
 async def cb_pos_stale(callback: CallbackQuery):
     await callback.answer("Этот выбор уже закрыт. Для смены должностей: /clientpos ID", show_alert=True)
 
