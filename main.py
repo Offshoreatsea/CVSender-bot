@@ -159,6 +159,10 @@ MERCHANT_VESSEL_TAGS = [
     "ReeferVessel", "TimberCarrier", "BargeCarrier", "DeckCargoVessel", "HeavyTransportVessel",
 ]
 TANKER_VESSEL_TAGS = [
+    "Tanker",  # обобщённый тег — когда в вакансии перечислено сразу НЕСКОЛЬКО
+               # подтипов танкеров одной фразой ("Oil, Chemical & VLCC Vessels",
+               # "our tanker fleet") и это описание диапазона судов компании,
+               # а не одного конкретного судна — см. правило в промпте ниже
     "ULCC", "SuezmaxTanker", "AframaxTanker", "PanamaxTanker", "HandysizeTanker", "SmallTanker",
     "CPPTanker", "DPPTanker", "LNGCarrier", "LPGCarrier", "LEGCarrier", "AmmoniaCarrier",
     "CO2Carrier", "ChemicalOilTanker", "JuiceCarrier", "OilTanker", "ChemicalTanker", "VLCC",
@@ -558,6 +562,13 @@ For each vacancy, extract:
     Supply" -> AHTS; "MPSV" -> MPSV; "DSV", "Diving Support Vessel" -> DSV
     "dredger", "dredging vessel", "TSHD", "trailing suction hopper dredger",
     "cutter suction dredger" -> Dredger
+  IMPORTANT: if the posting names SEVERAL tanker subtypes together in one phrase to
+  describe the company's range of vessels rather than one specific ship (e.g. "Oil,
+  Chemical & VLCC Vessels", "our tanker fleet", "VLCC/Suezmax/Aframax tankers") — this is
+  still clearly a tanker vacancy, just don't pick arbitrarily between the subtypes: use the
+  generic "Tanker" tag instead. Do NOT let an unclear choice between subtypes push you to
+  "Other" — "Other" should only be used when the vessel isn't a tanker/offshore/merchant
+  type at all, never as a way to avoid picking between valid tanker subtypes.
   If vessel type isn't stated or nothing in the list fits, use "Other" (this defaults the
   vacancy to the Merchant fleet — the safest fallback when the vessel type is unclear).
 - region: country/region/location, or null

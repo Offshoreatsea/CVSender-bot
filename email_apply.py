@@ -920,14 +920,14 @@ def _parse_positions(text: str) -> tuple[list[str], list[str]]:
 # порядок и группы кнопок — как задал владелец; один тег может стоять в двух группах
 # (HLO, Fitter/Welder) — отметка ставится/снимается сразу в обеих
 POSITION_GROUPS = [
-    ('⚓ Merchant · Bridge Officers', [
+    ('⚓ Торговый · Bridge Officers', [
         ('Master|Merchant', 'Master'),
         ('ChiefOfficer|Merchant', 'Chief Officer'),
         ('SecondOfficer|Merchant', '2nd Officer'),
         ('ThirdOfficer|Merchant', '3rd Officer'),
         ('JuniorOfficer|Merchant', 'Junior Officer'),
     ]),
-    ('⚓ Merchant · Engine Officers', [
+    ('⚓ Торговый · Engine Officers', [
         ('ChiefEngineer|Merchant', 'Chief Engineer'),
         ('SecondEngineer|Merchant', '2nd Engineer'),
         ('ThirdEngineer|Merchant', '3rd Engineer'),
@@ -937,7 +937,7 @@ POSITION_GROUPS = [
         ('Electrician|Merchant', 'Electrician'),
         ('GasEngineer|Merchant', 'Gas Engineer'),
     ]),
-    ('⚓ Merchant · Deck Ratings', [
+    ('⚓ Торговый · Deck Ratings', [
         ('Bosun|Merchant', 'Bosun'),
         ('AB|Merchant', 'AB'),
         ('OS|Merchant', 'OS'),
@@ -945,7 +945,7 @@ POSITION_GROUPS = [
         ('Welder|Merchant', 'Welder'),
         ('DeckCadet|Merchant', 'Deck Cadet'),
     ]),
-    ('⚓ Merchant · Engine Ratings', [
+    ('⚓ Торговый · Engine Ratings', [
         ('Oiler|Merchant', 'Oiler'),
         ('Wiper|Merchant', 'Wiper'),
         ('Motorman|Merchant', 'Motorman'),
@@ -953,14 +953,14 @@ POSITION_GROUPS = [
         ('Welder|Merchant', 'Welder'),
         ('EngineCadet|Merchant', 'Engine Cadet'),
     ]),
-    ('⚓ Merchant · Catering', [
+    ('⚓ Торговый · Catering', [
         ('Cook|Merchant', 'Cook'),
         ('NightCook|Merchant', 'Night Cook'),
         ('Steward|Merchant', 'Steward'),
         ('Messman|Merchant', 'Messman'),
         ('Baker|Merchant', 'Baker'),
     ]),
-    ('🛠 Offshore · Bridge Officers', [
+    ('⚓ Торговый · Bridge Officers (Offshore)', [
         ('MasterSDPO|Offshore', 'Master / SDPO'),
         ('Master|Offshore', 'Master'),
         ('ChiefOfficer|Offshore', 'Chief Officer'),
@@ -969,7 +969,7 @@ POSITION_GROUPS = [
         ('SafetyOfficer|Offshore', 'Safety Officer'),
         ('HLO|Offshore', 'HLO'),
     ]),
-    ('🛠 Offshore · Engine Officers', [
+    ('⚓ Торговый · Engine Officers (Offshore)', [
         ('ChiefEngineer|Offshore', 'Chief Engineer'),
         ('SecondEngineer|Offshore', '2nd Engineer'),
         ('ThirdEngineer|Offshore', '3rd Engineer'),
@@ -978,7 +978,7 @@ POSITION_GROUPS = [
         ('Electrician|Offshore', 'Electrician'),
         ('ElectricianAssistant|Offshore', 'Electrician Assistant'),
     ]),
-    ('🛠 Offshore · Deck Ratings', [
+    ('⚓ Торговый · Deck Ratings (Offshore)', [
         ('AB|Offshore', 'AB'),
         ('OS|Offshore', 'OS'),
         ('Bosun|Offshore', 'Bosun'),
@@ -991,7 +991,7 @@ POSITION_GROUPS = [
         ('Welder|Offshore', 'Welder'),
         ('DeckCadet|Offshore', 'Deck Cadet'),
     ]),
-    ('🛠 Offshore · Engine Ratings', [
+    ('⚓ Торговый · Engine Ratings (Offshore)', [
         ('Motorman|Offshore', 'Motorman'),
         ('Oiler|Offshore', 'Oiler'),
         ('Wiper|Offshore', 'Wiper'),
@@ -999,7 +999,7 @@ POSITION_GROUPS = [
         ('Welder|Offshore', 'Welder'),
         ('EngineCadet|Offshore', 'Engine Cadet'),
     ]),
-    ('🛠 Offshore · Catering', [
+    ('⚓ Торговый · Catering (Offshore)', [
         ('Cook|Offshore', 'Cook'),
         ('NightCook|Offshore', 'Night Cook'),
         ('Campboss|Offshore', 'Camp Boss'),
@@ -1007,14 +1007,14 @@ POSITION_GROUPS = [
         ('ChiefSteward|Offshore', 'Chief Steward'),
         ('Messman|Offshore', 'Messman'),
     ]),
-    ('🛢 Tanker · Bridge Officers', [
+    ('🛢 Танкера · Bridge Officers', [
         ('Master|Tanker', 'Master'),
         ('ChiefOfficer|Tanker', 'Chief Officer'),
         ('SecondOfficer|Tanker', '2nd Officer'),
         ('ThirdOfficer|Tanker', '3rd Officer'),
         ('JuniorOfficer|Tanker', 'Junior Officer'),
     ]),
-    ('🛢 Tanker · Engine Officers', [
+    ('🛢 Танкера · Engine Officers', [
         ('ChiefEngineer|Tanker', 'Chief Engineer'),
         ('SecondEngineer|Tanker', '2nd Engineer'),
         ('ThirdEngineer|Tanker', '3rd Engineer'),
@@ -1024,7 +1024,7 @@ POSITION_GROUPS = [
         ('Electrician|Tanker', 'Electrician'),
         ('GasEngineer|Tanker', 'Gas Engineer'),
     ]),
-    ('🛢 Tanker · Deck Ratings', [
+    ('🛢 Танкера · Deck Ratings', [
         ('Bosun|Tanker', 'Bosun'),
         ('AB|Tanker', 'AB'),
         ('OS|Tanker', 'OS'),
@@ -1032,7 +1032,7 @@ POSITION_GROUPS = [
         ('Welder|Tanker', 'Welder'),
         ('DeckCadet|Tanker', 'Deck Cadet'),
     ]),
-    ('🛢 Tanker · Engine Ratings', [
+    ('🛢 Танкера · Engine Ratings', [
         ('Oiler|Tanker', 'Oiler'),
         ('Wiper|Tanker', 'Wiper'),
         ('Motorman|Tanker', 'Motorman'),
@@ -1040,7 +1040,7 @@ POSITION_GROUPS = [
         ('Welder|Tanker', 'Welder'),
         ('EngineCadet|Tanker', 'Engine Cadet'),
     ]),
-    ('🛢 Tanker · Catering', [
+    ('🛢 Танкера · Catering', [
         ('Cook|Tanker', 'Cook'),
         ('NightCook|Tanker', 'Night Cook'),
         ('Steward|Tanker', 'Steward'),
