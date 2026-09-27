@@ -270,6 +270,19 @@ def mark_external_job_seen(source: str, external_id: str):
     conn.close()
 
 
+def has_any_external_jobs_seen(source: str) -> bool:
+    """Был ли для этого источника хоть один запуск раньше — используется,
+    чтобы отличить самый первый проход (когда страница листинга сайта может
+    содержать вакансии за несколько прошлых дней, а не только новые) от
+    всех последующих, обычных проходов."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM external_jobs_seen WHERE source = ? LIMIT 1", (source,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def add_scheduled_ad(channel: str, time_hhmm: str, text: str) -> int:
     conn = get_conn()
     cur = conn.execute(

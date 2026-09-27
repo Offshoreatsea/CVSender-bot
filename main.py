@@ -631,6 +631,21 @@ def slugify_tag(word: str) -> str:
     return "#" + re.sub(r"[^A-Za-z0-9]", "", word)
 
 
+def strip_links(value):
+    """Убирает http(s)- и голые www.-ссылки из строки (Google Drive, сайты
+    компаний и т.п. не публикуем ни в одном поле вакансии, независимо от
+    источника). None/пустая строка проходят как есть."""
+    if not value or not isinstance(value, str):
+        return value
+    value = re.sub(r"https?://\S+", "", value)
+    value = re.sub(r"\bwww\.\S+", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    # чистим висящие разделители, которые остаются после вырезания ссылки,
+    # например "email@x.com; " -> "email@x.com"
+    value = re.sub(r"[;,]\s*$", "", value.strip())
+    return value.strip() or None
+
+
 def ai_parse_batch(raw: str) -> list[dict]:
     fallback = [{
         "position": raw.strip().split("\n")[0][:120] or "Vacancy",
@@ -688,6 +703,14 @@ def ai_parse_batch(raw: str) -> list[dict]:
         item["vessel_tag"] = vessel_tag
         item["fleet_tag"] = fleet_tag
         item["hashtags"] = f"#{position_tag} #{vessel_tag} #{fleet_tag}Fleet"
+        # ссылки (Google Drive, сайты компаний и т.п.) не публикуем ни в одном
+        # текстовом поле — не только при скрейпинге CrewLink, но и в вакансиях,
+        # присланных руками: иногда в "Contact" вместе с email кладут ссылку
+        # на файл или сайт, это тоже нужно вырезать
+        for field_name in ("contact", "notes", "salary", "region", "nationality"):
+            item[field_name] = strip_links(item.get(field_name))
+        item["documents"] = [strip_links(d) for d in (item.get("documents") or [])]
+        item["requirements"] = [strip_links(r) for r in (item.get("requirements") or [])]
     return data
 
 
@@ -2782,15 +2805,30 @@ def strip_html_to_text(html: str) -> str:
     return text.strip()
 
 
-async def crewlink_scraper_worker(bot: Bot):
-    """Раз в CREWLINK_INTERVAL_MIN минут проверяет crewlink.me/jobs на новые
-    вакансии, разбирает их через тот же ai_parse_batch, что и обычные
-    вакансии от админа, и публикует по тем же правилам (авто/черновик,
-    дедупликация) — админ видит результат в личке, как если бы сам вставил
-    текст. Помечает каждую вакансию как "уже виденную" по её id из ссылки,
-    чтобы не разбирать повторно при следующем проходе."""
-    if not CREWLINK_ENABLED:
-        print("[crewlink_scraper_worker] Выключено через CREWLINK_ENABLED=false")
+async def generic_scraper_worker(bot: Bot, *, source: str, source_label: str, list_url: str,
+                                   extract_jobs, interval_min: int, enabled: bool,
+                                   first_run_sample: int | None = 2):
+    """Общий воркер для скрейпинга внешних job-бордов — раз в interval_min
+    минут проверяет list_url на новые вакансии, разбирает их через тот же
+    ai_parse_batch, что и обычные вакансии от админа, публикует по тем же
+    правилам (авто/черновик, дедупликация). Разные сайты подключаются через
+    extract_jobs(html_text) -> {job_id: job_url} — вся специфика конкретного
+    сайта (структура ссылок) остаётся в этой функции, воркер сам по себе
+    сайто-независимый.
+    Помечает каждую вакансию как "уже виденную" по её id, чтобы не разбирать
+    повторно при следующем проходе — id уникален В РАМКАХ source, поэтому
+    разные сайты не конфликтуют друг с другом даже при случайном совпадении id.
+    first_run_sample: на самом первом проходе для этого источника (когда ни
+    одной вакансии ещё не помечено виденной) обрабатывается только столько
+    вакансий для теста, а остальные из первой пачки просто помечаются
+    виденными без разбора — не нужен бэкфилл всей истории сайта ни для
+    одного источника, только новые вакансии начиная с этого момента.
+    По умолчанию 2 — это СТАНДАРТНОЕ поведение для КАЖДОГО источника,
+    существующего и любого нового, который будет добавлен позже; передавать
+    None стоит только если осознанно нужен полный бэкфилл при первом
+    запуске (обычно не нужен)."""
+    if not enabled:
+        print(f"[{source}_scraper_worker] Выключено")
         return
     await asyncio.sleep(30)  # даём боту полностью подняться перед первым проходом
     async with httpx.AsyncClient(
@@ -2798,16 +2836,27 @@ async def crewlink_scraper_worker(bot: Bot):
     ) as client:
         while True:
             try:
-                resp = await client.get(CREWLINK_JOBS_URL)
+                resp = await client.get(list_url)
                 resp.raise_for_status()
-                job_ids = sorted(set(CREWLINK_JOB_ID_RE.findall(resp.text)))
-                new_ids = [j for j in job_ids if not db.is_external_job_seen("crewlink", j)]
-                print(f"[crewlink_scraper_worker] Найдено {len(job_ids)} вакансий на странице, "
-                      f"новых: {len(new_ids)}")
+                jobs = extract_jobs(resp.text)  # {job_id: job_url}
+                new_ids = [j for j in jobs if not db.is_external_job_seen(source, j)]
+                is_first_run = first_run_sample is not None and not db.has_any_external_jobs_seen(source)
+                if is_first_run:
+                    # первый проход — берём только пробную выборку, остальное
+                    # из этой же пачки помечаем виденным молча, без разбора
+                    to_process = new_ids[:first_run_sample]
+                    to_skip = new_ids[first_run_sample:]
+                    for job_id in to_skip:
+                        db.mark_external_job_seen(source, job_id)
+                    print(f"[{source}_scraper_worker] Первый запуск: обрабатываю {len(to_process)} "
+                          f"для теста, помечаю виденными без разбора ещё {len(to_skip)}")
+                    new_ids = to_process
+                print(f"[{source}_scraper_worker] Найдено {len(jobs)} вакансий на странице, "
+                      f"новых к обработке: {len(new_ids)}")
                 auto = is_auto_publish()
                 for job_id in new_ids:
+                    job_url = jobs[job_id]
                     try:
-                        job_url = f"https://crewlink.me/jobs/{job_id}"
                         job_resp = await client.get(job_url)
                         job_resp.raise_for_status()
                         raw_text = strip_html_to_text(job_resp.text)[:6000]
@@ -2822,7 +2871,7 @@ async def crewlink_scraper_worker(bot: Bot):
                                     try:
                                         await bot.send_message(
                                             admin_id,
-                                            f"⚠️ CrewLink: похоже, уже публиковалось "
+                                            f"⚠️ {source_label}: похоже, уже публиковалось "
                                             f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}{source_note}",
                                             reply_markup=duplicate_keyboard(vacancy_id),
                                             link_preview_options=NO_PREVIEW,
@@ -2836,7 +2885,7 @@ async def crewlink_scraper_worker(bot: Bot):
                                     try:
                                         await bot.send_message(
                                             admin_id,
-                                            f"✅ CrewLink: опубликовано автоматически{source_note}\n\n{text}",
+                                            f"✅ {source_label}: опубликовано автоматически{source_note}\n\n{text}",
                                             link_preview_options=NO_PREVIEW,
                                         )
                                     except TelegramAPIError:
@@ -2846,20 +2895,69 @@ async def crewlink_scraper_worker(bot: Bot):
                                     try:
                                         await bot.send_message(
                                             admin_id,
-                                            f"🌐 Новая вакансия с CrewLink:{source_note}\n\n{text}",
+                                            f"🌐 Новая вакансия с {source_label}:{source_note}\n\n{text}",
                                             reply_markup=draft_keyboard(vacancy_id),
                                             link_preview_options=NO_PREVIEW,
                                         )
                                     except TelegramAPIError:
                                         pass
-                        db.mark_external_job_seen("crewlink", job_id)
+                        db.mark_external_job_seen(source, job_id)
                         await asyncio.sleep(2)  # не долбим сайт подряд без пауз
                     except Exception as e:
-                        print(f"[crewlink_scraper_worker] Ошибка на вакансии {job_id}: {e}")
+                        print(f"[{source}_scraper_worker] Ошибка на вакансии {job_id}: {e}")
                         # НЕ помечаем как seen — попробуем ещё раз в следующий проход
             except Exception as e:
-                print(f"[crewlink_scraper_worker] Ошибка при обходе списка вакансий: {e}")
-            await asyncio.sleep(CREWLINK_INTERVAL_MIN * 60)
+                print(f"[{source}_scraper_worker] Ошибка при обходе списка вакансий: {e}")
+            await asyncio.sleep(interval_min * 60)
+
+
+def extract_crewlink_jobs(html_text: str) -> dict[str, str]:
+    ids = sorted(set(CREWLINK_JOB_ID_RE.findall(html_text)))
+    return {job_id: f"https://crewlink.me/jobs/{job_id}" for job_id in ids}
+
+
+CREWLINK_TEST_SAMPLE = int(os.getenv("CREWLINK_TEST_SAMPLE", "2"))  # сколько разобрать на самом первом проходе — дальше только по-настоящему новые (у уже работающего источника это не сработает повторно, т.к. история "виденных" уже есть)
+
+
+async def crewlink_scraper_worker(bot: Bot):
+    await generic_scraper_worker(
+        bot, source="crewlink", source_label="CrewLink", list_url=CREWLINK_JOBS_URL,
+        extract_jobs=extract_crewlink_jobs, interval_min=CREWLINK_INTERVAL_MIN,
+        enabled=CREWLINK_ENABLED, first_run_sample=CREWLINK_TEST_SAMPLE,
+    )
+
+
+AINOSTRI_ENABLED = os.getenv("AINOSTRI_ENABLED", "true").lower() == "true"
+AINOSTRI_INTERVAL_MIN = int(os.getenv("AINOSTRI_INTERVAL_MIN", "45"))
+AINOSTRI_JOBS_URL = "https://www.ainostri.ro/job-offers/today-and-yesterday"
+# ссылка на карточку вакансии вида:
+# /job-offers/maritime/chief-officer-for-newbuilding-vlgc-dual-fuel-12940/today-and-yesterday
+# числовой id в конце слага уникален — используем его как ключ дедупликации.
+# Одна и та же вакансия может встретиться на странице под несколькими
+# разделами (maritime/cruise/offshore/ship-yard) с одним и тем же id —
+# берём первую попавшуюся ссылку для этого id, не разбираем дважды.
+AINOSTRI_JOB_RE = re.compile(
+    r"(/job-offers/[a-z-]+/[a-z0-9-]+-(\d+)/today-and-yesterday)"
+)
+
+
+def extract_ainostri_jobs(html_text: str) -> dict[str, str]:
+    jobs: dict[str, str] = {}
+    for path, job_id in AINOSTRI_JOB_RE.findall(html_text):
+        if job_id not in jobs:
+            jobs[job_id] = f"https://www.ainostri.ro{path}"
+    return jobs
+
+
+AINOSTRI_TEST_SAMPLE = int(os.getenv("AINOSTRI_TEST_SAMPLE", "2"))  # сколько разобрать на самом первом проходе (страница = "сегодня и вчера", без этого лимита в первый раз ушла бы вся пачка сразу)
+
+
+async def ainostri_scraper_worker(bot: Bot):
+    await generic_scraper_worker(
+        bot, source="ainostri", source_label="ainostri.ro", list_url=AINOSTRI_JOBS_URL,
+        extract_jobs=extract_ainostri_jobs, interval_min=AINOSTRI_INTERVAL_MIN,
+        enabled=AINOSTRI_ENABLED, first_run_sample=AINOSTRI_TEST_SAMPLE,
+    )
 
 
 async def main():
@@ -2883,6 +2981,7 @@ async def main():
     asyncio.create_task(subscription_reminder_worker(bot))
     asyncio.create_task(ad_scheduler_worker(bot))
     asyncio.create_task(crewlink_scraper_worker(bot))
+    asyncio.create_task(ainostri_scraper_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
