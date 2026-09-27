@@ -2774,6 +2774,28 @@ CREWLINK_JOB_ID_RE = re.compile(
 )
 
 
+_JUNK_POSITION_RE = re.compile(
+    r"cookie|consent|gdpr|privacy polic|404|page not found|access denied|"
+    r"acord.*cookie|utiliz.*cookie",
+    re.IGNORECASE,
+)
+
+
+def looks_like_junk(fields: dict) -> bool:
+    """Похоже ли, что это НЕ настоящая вакансия, а мусор со страницы (cookie-
+    баннер, страница ошибки, пустая JS-заглушка) — сигналы: и должность, и
+    тип судна не распознались вообще (оба Other), либо в тексте должности
+    прямо видны признаки постороннего контента страницы."""
+    position_tag = fields.get("position_tag") or "Other"
+    vessel_tag = fields.get("vessel_tag") or "Other"
+    if position_tag == "Other" and vessel_tag == "Other":
+        return True
+    position_text = fields.get("position") or ""
+    if _JUNK_POSITION_RE.search(position_text):
+        return True
+    return False
+
+
 def strip_html_to_text(html: str) -> str:
     """Грубая, но достаточная для наших целей очистка HTML в читаемый текст —
     без внешних библиотек (BeautifulSoup и т.п. в зависимостях нет). Итоговый
@@ -2795,6 +2817,14 @@ def strip_html_to_text(html: str) -> str:
     cutoff = re.search(r"CrewLink\s*[–-]\s*Joburi Maritime", text, flags=re.IGNORECASE)
     if cutoff:
         text = text[:cutoff.start()].strip()
+
+    # вырезаем блоки cookie-баннеров/GDPR-текста целиком построчно — на
+    # некоторых сайтах (например ainostri.ro) это самый заметный текст на
+    # странице, и без вырезания Claude иногда путает его с самой вакансией
+    cookie_line_re = re.compile(
+        r"(cookie|consent for the use|acord.*cookie|utiliz.*cookie)", re.IGNORECASE
+    )
+    text = "\n".join(line for line in text.split("\n") if not cookie_line_re.search(line))
 
     # убираем ссылки — целиком http(s)-адреса и голые www.-адреса, а не всю
     # строку целиком (в строке рядом может быть полезный текст, например email)
@@ -2866,6 +2896,25 @@ async def generic_scraper_worker(bot: Bot, *, source: str, source_label: str, li
                             vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
                             text = render_template(fields)
                             source_note = f"\n\n🌐 Источник: {job_url}"
+                            if looks_like_junk(fields):
+                                # страница не похожа на нормальную вакансию (cookie-баннер,
+                                # ошибка сайта, пустая JS-заглушка и т.п.) — не публикуем и не
+                                # предлагаем как обычный черновик, а явно предупреждаем, чтобы
+                                # админ проверил страницу вручную, а не пропустил тихий мусор
+                                for admin_id in ADMIN_IDS:
+                                    try:
+                                        await bot.send_message(
+                                            admin_id,
+                                            f"⚠️ {source_label}: не похоже на нормальную вакансию "
+                                            f"(возможно, страница не разобралась корректно) — "
+                                            f"проверьте вручную.{source_note}\n\n{text}",
+                                            reply_markup=draft_keyboard(vacancy_id),
+                                            link_preview_options=NO_PREVIEW,
+                                        )
+                                    except TelegramAPIError:
+                                        pass
+                                db.mark_external_job_seen(source, job_id)
+                                continue
                             if dup:
                                 for admin_id in ADMIN_IDS:
                                     try:
