@@ -185,14 +185,14 @@ def init_tables():
 
 def _q(sql, params=(), one=False, commit=False):
     conn = db.get_conn()
-    cur = conn.execute(sql, params)
-    if commit:
-        conn.commit()
-        res = cur.lastrowid
-    else:
-        res = cur.fetchone() if one else cur.fetchall()
-    conn.close()
-    return res
+    try:
+        cur = conn.execute(sql, params)
+        if commit:
+            conn.commit()
+            return cur.lastrowid
+        return cur.fetchone() if one else cur.fetchall()
+    finally:
+        conn.close()  # и при ошибке — иначе висящая транзакция держит блокировку записи
 
 
 def add_client(d: dict) -> int:

@@ -1785,13 +1785,22 @@ async def handle_vacancy_text(message: Message):
         )
         return
 
+    await process_vacancy_text(message, message.text)
+
+
+async def process_vacancy_text(message: Message, raw_text: str):
+    """Общий разбор+публикация текста вакансии — вынесено отдельно, чтобы
+    один и тот же путь обрабатывал и обычный текст (message.text), и
+    подпись к фото (message.caption): пересланные вакансии из других
+    telegram-групп очень часто идут картинкой (лого агентства/компании) с
+    текстом вакансии в подписи, а не обычным текстовым сообщением."""
     status_msg = await message.answer("Разбираю...")
     auto = is_auto_publish()
-    for fields in ai_parse_batch(message.text):
+    for fields in ai_parse_batch(raw_text):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, key, raw_text=message.text)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
         text = render_template(fields)
 
         if dup:
@@ -1818,6 +1827,17 @@ async def handle_vacancy_text(message: Message):
                 reply_markup=draft_keyboard(vacancy_id), link_preview_options=NO_PREVIEW,
             )
     await status_msg.delete()
+
+
+@router.message(F.photo & F.caption & ~F.caption.startswith("/"))
+async def handle_vacancy_photo_caption(message: Message):
+    """Пересланные вакансии из других групп часто идут картинкой (лого
+    агентства) с текстом вакансии в подписи — без этого обработчика такие
+    сообщения молча игнорировались (F.text не совпадал ни с чем, aiogram
+    просто не находил подходящий хэндлер, ни ошибки, ни ответа)."""
+    if not admin_only(message.from_user.id):
+        return
+    await process_vacancy_text(message, message.caption)
 
 
 @router.message(Command("ad"))
