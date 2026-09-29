@@ -3005,8 +3005,13 @@ AINOSTRI_JOBS_URL = "https://www.ainostri.ro/job-offers/today-and-yesterday"
 # Одна и та же вакансия может встретиться на странице под несколькими
 # разделами (maritime/cruise/offshore/ship-yard) с одним и тем же id —
 # берём первую попавшуюся ссылку для этого id, не разбираем дважды.
+# Раздел ship-yard — сухопутные вакансии судостроительного завода (сварщики,
+# слесари на верфи), это не члены экипажа судна — под наши теги должностей и
+# судов они в принципе не ложатся, только засоряют очередь "непохоже на
+# вакансию". Берём только реально морские разделы.
+AINOSTRI_CATEGORIES = ("maritime", "cruise", "offshore")
 AINOSTRI_JOB_RE = re.compile(
-    r"(/job-offers/[a-z-]+/[a-z0-9-]+-(\d+)/today-and-yesterday)"
+    r"(/job-offers/(?:" + "|".join(AINOSTRI_CATEGORIES) + r")/[a-z0-9-]+-(\d+)/today-and-yesterday)"
 )
 
 
@@ -3051,6 +3056,7 @@ async def main():
     asyncio.create_task(ad_scheduler_worker(bot))
     asyncio.create_task(crewlink_scraper_worker(bot))
     asyncio.create_task(ainostri_scraper_worker(bot))
+    asyncio.create_task(email_apply.mail_base_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
