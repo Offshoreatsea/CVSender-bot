@@ -2395,7 +2395,7 @@ async def mb_date(callback: CallbackQuery, state: FSMContext):
 async def mb_time_preset(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return await callback.answer()
-    _, cid, window = callback.data.split(":")
+    _, cid, window = callback.data.split(":", 2)  # окно вида "09:00-18:00" само содержит ":", разбиваем только первые два
     start, end = window.split("-")
     await _ask_interval(callback.message, int(cid), start, end, state, edit=True)
     await callback.answer()
