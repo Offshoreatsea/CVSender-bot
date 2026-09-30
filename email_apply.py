@@ -44,7 +44,7 @@ import ranks
 
 router = Router()
 
-MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "100"))          # писем в день с одного клиента
+MAIL_DAILY_LIMIT = int(os.getenv("MAIL_DAILY_LIMIT", "500"))          # писем в день с одного клиента
 MAIL_SEND_INTERVAL = int(os.getenv("MAIL_SEND_INTERVAL", "120"))     # сек. между письмами по умолчанию; у клиента можно 1-4 мин
 SEND_INTERVAL_CHOICES = [1, 2, 3, 4]                                 # минуты — кнопки в карточке клиента
 MAIL_VARY_LETTER = os.getenv("MAIL_VARY_LETTER", "on") == "on"       # слегка перефразировать cover letter каждый раз
@@ -2584,8 +2584,10 @@ async def _mail_base_tick(bot: Bot):
         last = _mailbase_last_tick.get(client_id, 0)
         if time.monotonic() - last < interval * random.uniform(0.85, 1.15):
             continue
+        # ORDER BY RANDOM(), а не по порядку из файла — у каждого клиента свой
+        # перемешанный порядок отправки, не по алфавиту/как шли в исходном списке
         target = _q("SELECT * FROM mail_base_targets WHERE client_id = ? AND status = 'pending' "
-                    "ORDER BY id LIMIT 1", (client_id,), one=True)
+                    "ORDER BY RANDOM() LIMIT 1", (client_id,), one=True)
         if not target:
             continue
         _mailbase_last_tick[client_id] = time.monotonic()
