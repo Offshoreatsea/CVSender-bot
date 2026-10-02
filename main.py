@@ -1,6 +1,7 @@
 import asyncio
 import html
 import io
+import sqlite3
 import json
 import os
 import random
@@ -1091,8 +1092,9 @@ async def cmd_start(message: Message, command: CommandObject):
     if admin_only(message.from_user.id):
         mode = "включена" if is_auto_publish() else "выключена"
         await message.answer(
-            "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
-            "Команды:\n"
+            "Пришлите текст вакансии в любом формате (или пачку через ---).\n\n"
+            "🛠 /admin — меню по разделам (проще, чем список ниже) · /health — состояние бота\n\n"
+            "Все команды:\n"
             "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
             "/contacts — список email/агентств из сохранённых вакансий\n"
             "/testchannel — проверить доступ бота к каналу\n"
@@ -1631,6 +1633,237 @@ async def cb_set_language(callback: CallbackQuery):
     await callback.message.edit_text(t(lang, "intro"))
     await show_department_or_paywall(callback.message, tg_id, lang, edit=False)
     await callback.answer()
+
+
+ADMIN_MENU_SECTIONS = {
+    "pub": ("📰 Публикация", [
+        "Просто вставьте текст вакансии (или перешлите пост/фото) — бот разберёт и предложит опубликовать",
+        "/autopublish [on|off] — публиковать без подтверждения",
+        "/testchannel — проверить, что бот может писать в оба канала",
+        "/unlockpositionsall — разблокировать выбор должностей всем подписчикам",
+        "/revokeallpositions confirm — снять должности у всех (после смены структуры)",
+        "CREWLINK_ENABLED / AINOSTRI_ENABLED (Railway Variables) — вкл/выкл скрейперы сайтов",
+    ]),
+    "subs": ("👥 Подписчики и оплаты", [
+        "/subscribers, /subscriberslist — список и статистика",
+        "/grant [@user] [дней] — выдать доступ вручную (оплата не картой)",
+        "/extendall [дней] — продлить всем в подарок",
+        "/revoke [@user] — отозвать доступ",
+        "/refund [@user] — вернуть последний платёж (карта или звёзды) и снять доступ",
+        "/blockuser, /unblockuser [@user]",
+        "/setposition [@user] [флот] [должности] — сменить вручную",
+        "/unlockpositions, /lockpositions [@user]",
+        "/testnotify [должность] [флот] — сколько подписчиков найдётся",
+        "/contacts, /getemails — выгрузка контактов из вакансий",
+    ]),
+    "replies": ("📧 Отклики по email", [
+        "/mail — главное меню (клиенты, шаблоны, пароль, тест)",
+        "/addclient, /delclient, /clients, /clientshow [id]",
+        "/clientpos, /clientsubject, /clientletter, /clientcv, /clientpass, /clientsmtp, /clientphone, /clientabout, /clientauto [id]",
+        "/testmail, /drafts, /sendall, /applyto, /backfill [id]",
+        "/mailsent, /mailhelp",
+    ]),
+    "mb": ("🎯 Точечная рассылка", [
+        "Кнопка «🎯 Разослать точечно» в карточке клиента (/mail → клиент) — файл → календарь → окно → интервал",
+        "/blast [id] [дней] — по HR из вакансий за N дней (не точечная база)",
+        "/mbcheck [id] — темп, прогноз, паузы, недоставленные",
+        "/mbresume [id] — возобновить с прежними настройками",
+        "/mbstop [id] — остановить",
+        "/bounces [id] — список недоставленных адресов",
+    ]),
+    "ads": ("📣 Реклама и сообщения", [
+        "/addad [main|tanker] [ЧЧ:ММ] [текст] — ежедневная реклама в канале",
+        "/listads, /deletead [id]",
+        "/broadcast [текст] — рассылка всем подписчикам, с превью и подтверждением",
+        "/broadcastuser [@user] [текст] — одному подписчику",
+    ]),
+    "ops": ("🛠 Обслуживание", [
+        "/health — состояние бота (база, воркеры, каналы)",
+        "/backup — копия базы файлом (плюс присылается сама каждую ночь)",
+        "/stats [дней] — вакансии и отклики за период",
+        "/revenue — выручка",
+    ]),
+}
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm:{key}")]
+            for key, (label, _) in ADMIN_MENU_SECTIONS.items()]
+    rows.append([
+        InlineKeyboardButton(text="🩺 Состояние", callback_data="adm_health"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats"),
+        InlineKeyboardButton(text="👤 Клиенты", callback_data="adm_clients"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("admin"))
+@router.message(Command("help"))
+async def cmd_admin(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer(
+        "🛠 <b>Меню администратора</b>\nВыберите раздел — покажу список команд.",
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def cb_admin_section(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
+    key = callback.data.split(":", 1)[1]
+    section = ADMIN_MENU_SECTIONS.get(key)
+    if not section:
+        return await callback.answer()
+    label, lines = section
+    text = f"<b>{label}</b>\n\n" + "\n".join(f"• {html.escape(l)}" for l in lines)
+    await callback.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm_back")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_back")
+async def cb_admin_back(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
+    await callback.message.edit_text(
+        "🛠 <b>Меню администратора</b>\nВыберите раздел — покажу список команд.",
+        reply_markup=admin_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_health")
+async def cb_admin_health(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
+    await callback.answer()
+    await cmd_health(callback.message, from_admin_button=True)
+
+
+@router.callback_query(F.data == "adm_stats")
+async def cb_admin_stats(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
+    await callback.answer()
+    s = db.daily_stats(1)
+    await callback.message.answer(f"📊 Опубликовано вакансий сегодня: {s['total']}\nПолная сводка: /stats [дней]")
+
+
+@router.callback_query(F.data == "adm_clients")
+async def cb_admin_clients(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
+    await callback.answer()
+    clients = email_apply.list_clients()
+    if not clients:
+        await callback.message.answer("Клиентов email-модуля пока нет. Добавить: /addclient")
+        return
+    lines = [f"👤 Клиентов: {len(clients)}\n"]
+    lines += [f"• #{c['id']} {c['full_name']} — {c['email']}" for c in clients[:30]]
+    if len(clients) > 30:
+        lines.append(f"…и ещё {len(clients) - 30}. Полный список: /clients")
+    await callback.message.answer("\n".join(lines))
+
+
+BOT_START_TIME = time.time()
+
+
+@router.message(Command("health"))
+async def cmd_health(message: Message, from_admin_button: bool = False):
+    if not from_admin_button and not admin_only(message.from_user.id):
+        return
+    uptime_sec = int(time.time() - BOT_START_TIME)
+    h, rem = divmod(uptime_sec, 3600)
+    m = rem // 60
+    db_path = db.DB_PATH
+    on_volume = db_path.startswith("/data")
+    db_size_mb = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
+    total_subs, _ = db.subscriber_stats()
+    try:
+        clients_n = len(email_apply.list_clients())
+    except Exception:
+        clients_n = "?"
+    lines = [
+        "🩺 <b>Состояние бота</b>",
+        f"Аптайм: {h}ч {m}мин",
+        f"База: <code>{html.escape(db_path)}</code> — "
+        + ("на Volume ✅" if on_volume else "⚠️ НЕ на Volume — данные потеряются при редеплое!"),
+        f"Размер базы: {db_size_mb:.1f} МБ",
+        f"Подписчиков: {total_subs}",
+        f"Клиентов email-модуля: {clients_n}",
+        f"Автопубликация: {'вкл' if is_auto_publish() else 'выкл'}",
+        f"CrewLink: {'вкл' if CREWLINK_ENABLED else 'выкл'} · ainostri: {'вкл' if AINOSTRI_ENABLED else 'выкл'}",
+        f"Каналы: @{CHANNEL_USERNAME}, @{TANKER_CHANNEL_USERNAME}",
+        f"Админов: {len(ADMIN_IDS)}",
+    ]
+    await message.answer("\n".join(lines))
+
+
+async def _make_db_backup(dest_path: str):
+    """sqlite3 .backup() вместо простого копирования файла — с WAL-режимом
+    часть данных может лежать в -wal, которого при обычном copy не будет."""
+    def _run():
+        src = sqlite3.connect(db.DB_PATH)
+        dest = sqlite3.connect(dest_path)
+        with dest:
+            src.backup(dest)
+        dest.close()
+        src.close()
+    await asyncio.to_thread(_run)
+
+
+async def _send_backup(bot: Bot, chat_id: int):
+    if not os.path.exists(db.DB_PATH):
+        await bot.send_message(chat_id, "❌ Файл базы не найден.")
+        return
+    tmp_path = f"/tmp/backup_{int(time.time())}.db"
+    try:
+        await _make_db_backup(tmp_path)
+        await bot.send_document(
+            chat_id,
+            FSInputFile(tmp_path, filename=f"backup_{datetime.now().strftime('%Y-%m-%d_%H%M')}.db"),
+            caption=f"💾 Бэкап базы — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC",
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await _send_backup(message.bot, message.chat.id)
+
+
+BACKUP_HOUR_UTC = int(os.getenv("BACKUP_HOUR_UTC", "3"))
+
+
+async def nightly_backup_worker(bot: Bot):
+    """Раз в сутки, в BACKUP_HOUR_UTC (по умолчанию 3:00 UTC), сама присылает
+    копию базы каждому админу — не нужно вспоминать про /backup вручную."""
+    last_sent_date = None
+    while True:
+        try:
+            now = datetime.utcnow()
+            today = now.strftime("%Y-%m-%d")
+            if now.hour == BACKUP_HOUR_UTC and last_sent_date != today:
+                last_sent_date = today
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await _send_backup(bot, admin_id)
+                    except Exception as e:
+                        print(f"[nightly_backup_worker] не удалось отправить админу {admin_id}: {e}")
+        except Exception as e:
+            print(f"[nightly_backup_worker] ошибка итерации (воркер продолжает работать): {e}")
+        await asyncio.sleep(300)
 
 
 @router.message(Command("stats"))
@@ -3190,6 +3423,7 @@ async def main():
     asyncio.create_task(crewlink_scraper_worker(bot))
     asyncio.create_task(ainostri_scraper_worker(bot))
     asyncio.create_task(email_apply.mail_base_worker(bot))
+    asyncio.create_task(nightly_backup_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
