@@ -94,13 +94,6 @@ async def handle_filters(request: web.Request) -> web.Response:
     return web.json_response({"regions": db.distinct_regions()})
 
 
-async def handle_vacancies(request: web.Request) -> web.Response:
-    region = request.query.get("region", "").strip()
-    q = request.query.get("q", "").strip()
-    rows = db.search_published_vacancies(region=region, q=q, limit=100)
-    return web.json_response([vacancy_to_dict(r) for r in rows])
-
-
 def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None) -> web.Application:
     app = web.Application()
 
@@ -192,6 +185,26 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                           f"возможно, первый платёж прошёл до того, как появилась привязка customer_id")
 
         return web.Response(status=200, text="ok")
+
+    async def handle_vacancies(request: web.Request) -> web.Response:
+        # раньше этот эндпоинт был открыт без всякой проверки и отдавал
+        # contact (email рекрутера) всем подряд — через /api/vacancies?limit=100
+        # можно было бесплатно выкачать все контакты, которые как раз и
+        # продаются платным дайджестом. Теперь contact виден только тем, кто
+        # реально платил — та же логика, что и в самом боте (hide_contact)
+        region = request.query.get("region", "").strip()
+        q = request.query.get("q", "").strip()
+        init_data = request.query.get("initData", "")
+        tg_id = get_authenticated_tg_id(init_data)
+        hide_contact = tg_id is None or db.count_payments(tg_id) == 0
+        rows = db.search_published_vacancies(region=region, q=q, limit=100)
+        out = []
+        for r in rows:
+            d = vacancy_to_dict(r)
+            if hide_contact:
+                d["contact"] = None
+            out.append(d)
+        return web.json_response(out)
 
     async def handle_get_profile(request: web.Request) -> web.Response:
         init_data = request.query.get("initData", "")
