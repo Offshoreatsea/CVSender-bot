@@ -621,6 +621,19 @@ def extend_subscription(tg_id: int, days: int):
     return new_until
 
 
+def revoke_subscription(tg_id: int):
+    """Немедленно прекращает доступ (используется при возврате оплаты —
+    /refund раньше отмечал платёж возвращённым, но саму подписку не трогал,
+    и доступ оставался активным до прежней даты окончания)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?",
+        (datetime.now().isoformat(), tg_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def set_stripe_customer_id(tg_id: int, customer_id: str):
     conn = get_conn()
     conn.execute(
@@ -728,6 +741,18 @@ def revoke_subscription(tg_id: int):
     conn.execute("UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?", (past, tg_id))
     conn.commit()
     conn.close()
+
+
+def payment_exists(charge_id: str) -> bool:
+    """Stripe (и, реже, Stars) может доставить уведомление об одном и том же
+    платеже больше одного раза — без этой проверки подписка продлевалась и
+    реферальный бонус начислялся за каждую повторную доставку одного charge_id."""
+    if not charge_id:
+        return False
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM payments WHERE charge_id = ?", (charge_id,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,

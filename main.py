@@ -14,7 +14,7 @@ import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
@@ -1031,15 +1031,18 @@ async def do_publish(bot: Bot, vacancy_id: int):
     )
     db.set_status(vacancy_id, "published", message_id)
 
-    # публикация в канал уже состоялась и подтверждена выше — рассылка
-    # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
-    # не выглядел как ошибка самой публикации
+    # публикация в канал уже состоялась и подтверждена выше — админ должен
+    # увидеть "✅ Опубликовано" сразу, не дожидаясь рассылки всем
+    # подписчикам (это могло занимать долго при большой базе и выглядело как
+    # зависшая кнопка). Рассылка и черновики откликов уходят в фон.
+    asyncio.create_task(_post_publish_background(bot, vacancy_id, fields))
+
+
+async def _post_publish_background(bot: Bot, vacancy_id: int, fields: dict):
     try:
         await notify_subscribers(bot, vacancy_id, fields)
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
-
-    # черновики откликов по email с почты клиентов — тоже изолированно
     try:
         await email_apply.propose_for_vacancy(bot, vacancy_id)
     except Exception as e:
@@ -1230,6 +1233,12 @@ async def cb_pay_subscription(callback: CallbackQuery):
         return
     _, days_str, price_str = callback.data.split(":")
     days, price = int(days_str), int(price_str)
+    # days/price приходят из callback_data, которую любой клиент Telegram
+    # может подделать (например "pay_sub:365:1" — 365 дней за 1 звезду) —
+    # сверяем с единственной легитимной парой, а не доверяем присланному
+    if (days, price) != (SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS):
+        await callback.answer("Эта ссылка на оплату устарела, оформите заново: /subscribe", show_alert=True)
+        return
     await callback.bot.send_invoice(
         chat_id=tg_id,
         title=f"CV Sender — Job Alerts ({days} days)",
@@ -1351,6 +1360,11 @@ async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
                                 amount=None, currency: str = "XTR", provider: str = "stars"):
     """Общая точка доставки купленного дайджеста — используется и для оплаты
     звёздами, и для Stripe."""
+    if db.payment_exists(charge_id):
+        # повторная доставка вебхука на один и тот же платёж — иначе дайджест
+        # уходил бы человеку второй раз на каждый повтор уведомления
+        print(f"[deliver_email_digest] charge_id={charge_id} уже обработан, пропускаю повтор")
+        return
     amount = amount if amount is not None else EMAIL_DIGEST_PRICE_STARS
     db.insert_payment(tg_id, amount, 0, charge_id, provider=provider, currency=currency)
     lang = db.get_subscriber_language(tg_id)
@@ -1400,6 +1414,12 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
     Stars (process_successful_payment) или из Stripe (вебхук в webapp.py).
     Делает: запись платежа, продление подписки, разблокировку должностей,
     сообщение кандидату, реферальный бонус, уведомление админу."""
+    if db.payment_exists(charge_id):
+        # Stripe повторяет доставку уведомлений об одном и том же платеже —
+        # без этой проверки один платёж продлевал подписку (и реферальный
+        # бонус) дважды при повторной доставке того же события
+        print(f"[finalize_subscription_payment] charge_id={charge_id} уже обработан, пропускаю повтор")
+        return
     is_first_payment = db.count_payments(tg_id) == 0
     db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
@@ -1454,13 +1474,36 @@ async def process_successful_payment(message: Message):
         await deliver_email_digest(message.bot, tg_id, sp.telegram_payment_charge_id)
         return
 
-    # payload несёт реальные дни/цену конкретного тарифа — не полагаемся на
-    # константы по умолчанию на случай если тарифы ещё поменяются
+    # payload — это просто строка, которую сами же формировали при выдаче
+    # инвойса; Telegram ничего в ней не проверяет и прислал бы её обратно
+    # любой, даже если бы инвойс был создан с подделанной ценой. Доверять
+    # можно только sp.total_amount — сумме, которую Telegram сам подтвердил
+    # как реально списанную. Дни считаем от неё, а не от того, что написано
+    # в payload (та самая "365 дней за 1 звезду", только теперь не пройдёт,
+    # даже если инвойс с неверной ценой всё же как-то создастся).
     try:
         _, _, days_str, price_str = payload.split("_")
-        days, price = int(days_str), int(price_str)
+        claimed_days, claimed_price = int(days_str), int(price_str)
     except (ValueError, AttributeError):
-        days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
+        claimed_days, claimed_price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
+    price = sp.total_amount  # фактически списанная сумма — ей доверяем
+    if claimed_price == SUBSCRIPTION_PRICE_STARS and price == SUBSCRIPTION_PRICE_STARS:
+        days = SUBSCRIPTION_DAYS
+    else:
+        # сумма не совпала с единственным легитимным тарифом — пересчитываем
+        # дни пропорционально РЕАЛЬНО уплаченному, не тому, что заявлено в payload
+        price_per_day = SUBSCRIPTION_PRICE_STARS / SUBSCRIPTION_DAYS
+        days = max(1, round(price / price_per_day)) if price_per_day else SUBSCRIPTION_DAYS
+        for admin_id in ADMIN_IDS:
+            try:
+                await message.bot.send_message(
+                    admin_id,
+                    f"⚠️ Звёздная оплата с нестандартной суммой: {price} XTR (ожидалось "
+                    f"{SUBSCRIPTION_PRICE_STARS}) от {tg_id}, charge_id={sp.telegram_payment_charge_id}. "
+                    f"Выдал {days} дн. пропорционально оплате — проверьте вручную.",
+                )
+            except TelegramAPIError:
+                pass
 
     await finalize_subscription_payment(
         message.bot, tg_id, days, price, "XTR", sp.telegram_payment_charge_id,
@@ -1818,7 +1861,10 @@ async def process_vacancy_text(message: Message, raw_text: str):
     текстом вакансии в подписи, а не обычным текстовым сообщением."""
     status_msg = await message.answer("Разбираю...")
     auto = is_auto_publish()
-    for fields in ai_parse_batch(raw_text):
+    # ai_parse_batch синхронный (блокирующий вызов Claude API, 10-60 сек) —
+    # без to_thread он замораживал ВЕСЬ бот на это время для всех
+    parsed = await asyncio.to_thread(ai_parse_batch, raw_text)
+    for fields in parsed:
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
@@ -2378,15 +2424,26 @@ async def cmd_refund(message: Message, command: CommandObject):
     if not payment:
         await message.answer(f"У {handle} нет неоплаченных возвратом платежей.")
         return
+    # раньше ВСЕГДА пробовали звёздный возврат, даже если платёж был картой
+    # через Stripe — для Stripe это просто падало с ошибкой, возврат не
+    # проходил вообще никак
+    provider = payment["provider"] or "stars"
     try:
-        await message.bot.refund_star_payment(
-            user_id=row["tg_id"], telegram_payment_charge_id=payment["charge_id"]
-        )
-    except TelegramAPIError as e:
-        await message.answer(f"❌ Не удалось вернуть: {e}")
+        if provider == "stripe":
+            await asyncio.to_thread(stripe.Refund.create, payment_intent=payment["charge_id"])
+        else:
+            await message.bot.refund_star_payment(
+                user_id=row["tg_id"], telegram_payment_charge_id=payment["charge_id"]
+            )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось вернуть ({provider}): {e}")
         return
     db.mark_payment_refunded(payment["id"])
-    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}.")
+    # возврат оплаты раньше не снимал доступ — подписка оставалась активной
+    # до прежней даты окончания, хотя деньги уже вернули
+    db.revoke_subscription(row["tg_id"])
+    symbol = "⭐" if provider == "stars" else (payment["currency"] or "")
+    await message.answer(f"✅ Возвращено {payment['amount_stars']}{symbol} пользователю {handle}. Доступ снят.")
 
 
 @router.message(Command("revenue"))
@@ -2616,16 +2673,24 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
         # бесплатном триале видно вакансию целиком, кроме email/телефона
         hide_contact = db.count_payments(tg_id) == 0
         lang = db.get_subscriber_language(tg_id)
-        try:
-            await bot.send_message(
-                tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
-                reply_markup=channel_keyboard(vacancy_id, is_tanker=is_tanker),
-                link_preview_options=NO_PREVIEW,
-            )
-            db.mark_vacancy_sent(tg_id, vacancy_id)
-            await asyncio.sleep(0.1)
-        except TelegramAPIError:
-            pass
+        # TelegramRetryAfter (флуд-контроль) раньше ловился тем же except
+        # TelegramAPIError и просто проглатывался — человек терял вакансию
+        # навсегда, без повторной попытки. Теперь ждём и шлём снова.
+        for attempt in range(2):
+            try:
+                await bot.send_message(
+                    tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
+                    reply_markup=channel_keyboard(vacancy_id, is_tanker=is_tanker),
+                    link_preview_options=NO_PREVIEW,
+                )
+                db.mark_vacancy_sent(tg_id, vacancy_id)
+                await asyncio.sleep(0.1)
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                continue  # повторяем попытку именно этому подписчику
+            except TelegramAPIError:
+                break
 
 
 @router.message(Command("search"))
@@ -2781,12 +2846,31 @@ async def cb_fix(callback: CallbackQuery):
 
 async def digest_worker(bot: Bot):
     while True:
-        due = db.get_due_queue(datetime.now().isoformat())
-        for row in due:
-            try:
-                await do_publish(bot, row["id"])
-            except TelegramAPIError:
-                pass
+        # try/except раньше оборачивал только отправку КАЖДОГО поста — если
+        # падал сам db.get_due_queue (например при временном сбое базы),
+        # исключение вылетало из цикла целиком, и воркер умирал насовсем до
+        # следующего деплоя. Теперь ловим вообще всё тело итерации.
+        try:
+            due = db.get_due_queue(datetime.now().isoformat())
+            for row in due:
+                try:
+                    await do_publish(bot, row["id"])
+                except TelegramAPIError as e:
+                    # раньше при ошибке статус оставался 'queued', и тот же
+                    # пост пытался опубликоваться КАЖДУЮ минуту молча,
+                    # бесконечно — переносим на 15 минут и сообщаем админу
+                    db.set_schedule(row["id"], (datetime.now() + timedelta(minutes=15)).isoformat())
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"❌ Отложенный пост id={row['id']} не опубликовался: {e}\n"
+                                f"Попробую снова через 15 минут.",
+                            )
+                        except TelegramAPIError:
+                            pass
+        except Exception as e:
+            print(f"[digest_worker] ошибка итерации (воркер продолжает работать): {e}")
         await asyncio.sleep(60)
 
 
@@ -2794,18 +2878,21 @@ async def subscription_reminder_worker(bot: Bot):
     # проверяем раз в час; окно напоминания — 3 дня, чтобы предупредить
     # заранее о предстоящем списании за следующий период
     while True:
-        expiring = db.get_expiring_subscribers(within_hours=72)
-        for row in expiring:
-            lang = row["language"]
-            try:
-                await bot.send_message(
-                    row["tg_id"],
-                    t(lang, "expiry_reminder"),
-                    reply_markup=payment_keyboard(lang, row["tg_id"]),
-                )
-                db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
-            except TelegramAPIError:
-                pass
+        try:
+            expiring = db.get_expiring_subscribers(within_hours=72)
+            for row in expiring:
+                lang = row["language"]
+                try:
+                    await bot.send_message(
+                        row["tg_id"],
+                        t(lang, "expiry_reminder"),
+                        reply_markup=payment_keyboard(lang, row["tg_id"]),
+                    )
+                    db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
+                except TelegramAPIError:
+                    pass
+        except Exception as e:
+            print(f"[subscription_reminder_worker] ошибка итерации (воркер продолжает работать): {e}")
         await asyncio.sleep(3600)
 
 
@@ -2814,17 +2901,20 @@ async def ad_scheduler_worker(bot: Bot):
     ежедневных реклам (см. /addad) в канал. Каждая реклама шлётся не чаще
     одного раза в день, отдельным сообщением (без прикрепления вакансии)."""
     while True:
-        now = datetime.now()
-        current_hhmm = now.strftime("%H:%M")
-        today = now.strftime("%Y-%m-%d")
-        due = db.get_due_ads(current_hhmm, today)
-        for ad in due:
-            chat_id = TANKER_CHANNEL_ID if ad["channel"] == "tanker" else CHANNEL_ID
-            try:
-                await bot.send_message(chat_id, ad["text"], link_preview_options=NO_PREVIEW)
-                db.mark_ad_sent_today(ad["id"], today)
-            except TelegramAPIError as e:
-                print(f"[ad_scheduler_worker] Не удалось отправить рекламу id={ad['id']}: {e}")
+        try:
+            now = datetime.now()
+            current_hhmm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            due = db.get_due_ads(current_hhmm, today)
+            for ad in due:
+                chat_id = TANKER_CHANNEL_ID if ad["channel"] == "tanker" else CHANNEL_ID
+                try:
+                    await bot.send_message(chat_id, ad["text"], link_preview_options=NO_PREVIEW)
+                    db.mark_ad_sent_today(ad["id"], today)
+                except TelegramAPIError as e:
+                    print(f"[ad_scheduler_worker] Не удалось отправить рекламу id={ad['id']}: {e}")
+        except Exception as e:
+            print(f"[ad_scheduler_worker] ошибка итерации (воркер продолжает работать): {e}")
         await asyncio.sleep(60)
 
 
@@ -2952,7 +3042,8 @@ async def generic_scraper_worker(bot: Bot, *, source: str, source_label: str, li
                         job_resp = await client.get(job_url)
                         job_resp.raise_for_status()
                         raw_text = strip_html_to_text(job_resp.text)[:6000]
-                        for fields in ai_parse_batch(raw_text):
+                        parsed = await asyncio.to_thread(ai_parse_batch, raw_text)
+                        for fields in parsed:
                             key = dedup_key_for(fields)
                             dup = db.find_recent_duplicate(key)
                             vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
