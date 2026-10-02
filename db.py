@@ -593,8 +593,16 @@ def is_subscription_active(tg_id: int) -> bool:
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная
-    оплата не сгорала впустую)."""
+    оплата не сгорала впустую). Сама гарантирует, что строка подписчика
+    существует — раньше это был обычный UPDATE, и если человек писал
+    /subscribe первым делом, ни разу не пройдя /start, строки ещё не было,
+    UPDATE молча ничего не менял, и триал считался выданным, а на деле
+    не сохранялся вообще."""
     conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO subscribers (tg_id, subscribed_at) VALUES (?, ?)",
+        (tg_id, datetime.now().isoformat()),
+    )
     row = conn.execute(
         "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
     ).fetchone()

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import json
 import os
@@ -716,17 +717,22 @@ def ai_parse_batch(raw: str) -> list[dict]:
 
 def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None,
                      show_channel_link: bool = True) -> str:
+    # parse_mode=HTML: любой "<" или "&" в тексте вакансии (например "<2000$"
+    # в зарплате) иначе ломает разбор HTML у Telegram и пост не публикуется —
+    # экранируем всё, что пришло из текста вакансии, а не задано нами самими
     def val(key):
         v = fields.get(key)
-        return v if v else None
+        return html.escape(str(v)) if v else None
 
     def as_list(key):
         v = fields.get(key)
         if isinstance(v, list):
-            return v
-        if isinstance(v, str) and v.strip():
-            return [l for l in v.split("\n") if l.strip()]
-        return []
+            items = v
+        elif isinstance(v, str) and v.strip():
+            items = [l for l in v.split("\n") if l.strip()]
+        else:
+            items = []
+        return [html.escape(str(i)) for i in items]
 
     date_val = val("date") or val("dates")
 
@@ -759,7 +765,7 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("notes"):
         parts.append("")
-        parts.append(f"ℹ️ {fields['notes']}")
+        parts.append(f"ℹ️ {html.escape(str(fields['notes']))}")
 
     if val("contact"):
         parts.append("")
@@ -834,7 +840,23 @@ def render_caption(fields: dict) -> str:
     footer = lines[-1]
     head = "\n".join(lines[:-1])
     budget = CAPTION_LIMIT - len(footer) - 2  # 2 символа на "…\n"
-    return head[:budget].rstrip() + "…\n" + footer
+    return _safe_html_cut(head, budget) + "…\n" + footer
+
+
+def _safe_html_cut(text: str, budget: int) -> str:
+    """Режет text по budget символов, НЕ разрывая HTML-тег (<b>) или entity
+    (&amp;) посередине — иначе Telegram отказывается публиковать пост
+    целиком (именно так ловился баг с обрывом длинных вакансий)."""
+    cut = text[:budget]
+    # разрез внутри незакрытого тега "<...": откатываемся до символа перед "<"
+    last_lt = cut.rfind("<")
+    if last_lt != -1 and cut.find(">", last_lt) == -1:
+        cut = cut[:last_lt]
+    # разрез внутри незакрытой entity "&...;": откатываемся до символа перед "&"
+    last_amp = cut.rfind("&")
+    if last_amp != -1 and cut.find(";", last_amp) == -1:
+        cut = cut[:last_amp]
+    return cut.rstrip()
 
 
 def dedup_key_for(fields: dict) -> str:
@@ -2643,6 +2665,8 @@ async def cmd_applications(message: Message):
 
 @router.callback_query(F.data.startswith("adpub:"))
 async def cb_ad_publish(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     ad_id = int(callback.data.split(":")[1])
     text = ad_drafts.pop(ad_id, None)
     if not text:
@@ -2655,6 +2679,8 @@ async def cb_ad_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adcancel:"))
 async def cb_ad_cancel(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     ad_id = int(callback.data.split(":")[1])
     ad_drafts.pop(ad_id, None)
     await callback.message.edit_text("Отменено")
@@ -2684,7 +2710,15 @@ async def cmd_testchannel(message: Message):
 
 @router.callback_query(F.data.startswith("pub:"))
 async def cb_publish(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
+    # двойной клик по "Опубликовать" (или два админа одновременно) раньше
+    # публиковал вакансию дважды — статус 'published' это теперь блокирует
+    current = db.get_vacancy(vacancy_id)
+    if current and current["status"] == "published":
+        await callback.answer("Уже опубликовано")
+        return
     try:
         await do_publish(callback.bot, vacancy_id)
     except TelegramAPIError as e:
@@ -2701,6 +2735,8 @@ async def cb_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queue:"))
 async def cb_queue(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=queue_delay_keyboard(vacancy_id))
     await callback.answer()
@@ -2708,6 +2744,8 @@ async def cb_queue(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queuedelay:"))
 async def cb_queue_delay(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     _, vacancy_id_str, hours_str = callback.data.split(":")
     vacancy_id, hours = int(vacancy_id_str), int(hours_str)
     slot = datetime.now() + timedelta(hours=hours)
@@ -2720,6 +2758,8 @@ async def cb_queue_delay(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     db.set_status(vacancy_id, "cancelled")
     await callback.message.edit_text("Отменено")
@@ -2728,6 +2768,8 @@ async def cb_cancel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fix:"))
 async def cb_fix(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     pending_corrections[callback.from_user.id] = vacancy_id
     await callback.message.answer(
