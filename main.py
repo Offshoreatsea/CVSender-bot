@@ -159,6 +159,7 @@ MERCHANT_VESSEL_TAGS = [
     "HeavyLiftVessel", "ContainerShip", "FeederContainerVessel", "CoasterVessel", "RoRoVessel",
     "RoPax", "PureCarAndTruckCarrier", "PureCarCarrier", "CarCarrier", "LivestockCarrier",
     "ReeferVessel", "TimberCarrier", "BargeCarrier", "DeckCargoVessel", "HeavyTransportVessel",
+    "PassengerVessel",  # "Passenger ship", "Cruise ship" без доп. уточнений — Merchant, не Offshore/Tanker
 ]
 TANKER_VESSEL_TAGS = [
     "Tanker",  # обобщённый тег — когда в вакансии перечислено сразу НЕСКОЛЬКО
@@ -180,6 +181,9 @@ OFFSHORE_VESSEL_TAGS = [
     "CraneVessel", "ConstructionVessel", "AccommodationVessel", "Flotel", "StandbyVessel",
     "OSRV", "FFV", "WSV", "WIV", "WellTestingVessel",
     "FPSO", "FSO", "FPU", "FLNG", "FSRU",  # плавучие добычные платформы — в офшоре, не в танкерах
+    "OffshoreSupportVessel",  # обобщённый тег — "Offshore Support Vessel", "Offshore Installation
+    # Vessel", судно с упоминанием DP/ДП без уточнения конкретного типа, голое упоминание ROV —
+    # всё это явно офшор, но не подходит ни под один конкретный тег выше
 ]
 
 VESSEL_TAGS = MERCHANT_VESSEL_TAGS + TANKER_VESSEL_TAGS + OFFSHORE_VESSEL_TAGS
@@ -516,7 +520,8 @@ For each vacancy, extract:
     "Boatswain", "Bosun's Mate" -> Bosun
     "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
     "OS", "Ordinary Seaman" -> OS
-    "Motorman", "Engine Rating" -> Motorman
+    "Motorman", "Engine Rating", "Pumpman" (tanker/offshore cargo pump rating — no
+    separate tag exists for it), "Plumber" -> Motorman
     "Oiler" -> Oiler; "Wiper" -> Wiper — these are DIFFERENT ratings, don't merge them
     "Fitter", "Engine Fitter" -> Fitter; "Welder" -> Welder
     "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook; "Night Cook" -> NightCook
@@ -564,6 +569,15 @@ For each vacancy, extract:
     Supply" -> AHTS; "MPSV" -> MPSV; "DSV", "Diving Support Vessel" -> DSV
     "dredger", "dredging vessel", "TSHD", "trailing suction hopper dredger",
     "cutter suction dredger" -> Dredger
+    "passenger ship", "passenger vessel", "cruise ship" (with no other merchant subtype
+    stated) -> PassengerVessel
+    "Offshore Support Vessel", "OSV" (generic, not a specific PSV/AHTS/MPSV/DSV/CSV type),
+    "Offshore Installation Vessel", "offshore construction support", a bare mention of "ROV"
+    with no more specific vessel name, or a vessel described only by its DP class ("DP2
+    vessel", "DP1", "DP3", "dynamic positioning vessel") with no other vessel type given ->
+    OffshoreSupportVessel. More generally: if the vessel description contains the word
+    "offshore" and nothing more specific above fits, use OffshoreSupportVessel rather than
+    falling through to "Other" (which would wrongly default the vacancy to Merchant fleet).
   IMPORTANT: if the posting names SEVERAL tanker subtypes together in one phrase to
   describe the company's range of vessels rather than one specific ship (e.g. "Oil,
   Chemical & VLCC Vessels", "our tanker fleet", "VLCC/Suezmax/Aframax tankers") — this is
@@ -885,15 +899,15 @@ def apply_button_url(vacancy_id: int) -> str:
 
 
 def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: bool = True) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(
+    rows = []
+    if not include_menu:
+        # "Get More Offers" — только в самом канале. В личку подписчику (куда
+        # include_menu=True) её не шлём: он туда и так уже попал через бота,
+        # кнопка там не нужна и выглядела как цикл "зайди туда, где уже есть"
+        rows.append([InlineKeyboardButton(
             text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
-        )],
-        [
-            InlineKeyboardButton(text="📄 Seamans Documents", url="https://t.me/cvsenderforsea"),
-            InlineKeyboardButton(text="✉️ CV Distribution", url="https://cv-sender.com"),
-        ],
-    ]
+        )])
+    rows.append([InlineKeyboardButton(text="✉️ CV Distribution", callback_data="cvdist")])
     if is_tanker:
         # под каждой танкерной вакансией — отдельная кнопка на канал
         # танкерных вакансий (сейчас указывает туда же, куда и обычный
@@ -908,6 +922,18 @@ def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: boo
                                            url=f"https://t.me/{BOT_USERNAME}?start=menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+
+@router.callback_query(F.data == "cvdist")
+async def cb_cv_distribution(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "✉️ <b>CV Distribution</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="I would like to send my cv to companies", url="https://cv-sender.com")],
+            [InlineKeyboardButton(text="⬅️ Back to main menu", url=f"https://t.me/{BOT_USERNAME}?start=menu")],
+        ]),
+    )
 
 
 def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -1151,11 +1177,25 @@ def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inlin
         # какому именно tg_id принадлежит платёж
         stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
+    rows.append([InlineKeyboardButton(text="💳 Card (UAH)", callback_data="pay_uah")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
     rows.append([InlineKeyboardButton(text="🆔 My ID", callback_data="showmyid")])
     rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+UAH_CARD_NUMBER = os.getenv("UAH_CARD_NUMBER", "5358 3808 8089 8138")
+
+
+@router.callback_query(F.data == "pay_uah")
+async def cb_pay_uah(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        f"💳 Оплата картой в гривне:\n<code>{UAH_CARD_NUMBER}</code>\n\n"
+        f"После оплаты скопируйте свой ID (кнопка «🆔 My ID») и пришлите администратору — "
+        f"доступ откроем вручную."
+    )
 
 
 async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit: bool):
@@ -1242,7 +1282,10 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
 @router.callback_query(F.data == "digest_count")
 async def cb_digest_count(callback: CallbackQuery):
     lang = db.get_subscriber_language(callback.from_user.id)
-    count = len(db.list_contacts_since(7))
+    # считаем уникальные email, а не сырые строки контактов — иначе цифра тут
+    # не совпадает с тем, что реально приходит после оплаты (там именно email)
+    contacts = db.list_contacts_since(7)
+    count = len({extract_email(c) for c in contacts if extract_email(c)})
     await callback.answer(t(lang, "digest_count_result", count=count), show_alert=True)
 
 
@@ -1263,16 +1306,20 @@ async def cb_digest_demo(callback: CallbackQuery):
         await callback.answer(t(lang, "digest_demo_limit_reached"), show_alert=True)
         return
     contacts = db.list_contacts_since(7)
-    if not contacts:
+    # раньше тут брался случайный РАЗДЕЛ сырого поля "контакт" целиком — в нём
+    # мог быть телефон/WhatsApp-ссылка/имя в скобках вперемешку с email, как и
+    # в полном платном дайджесте, здесь нужен именно email, ничего больше
+    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
+    if not emails:
         await callback.answer(t(lang, "digest_empty"), show_alert=True)
         return
-    sample = random.sample(contacts, min(5, len(contacts)))
-    lines = "\n".join(f"• {c}" for c in sample)
+    sample = random.sample(emails, min(5, len(emails)))
+    lines = "\n".join(f"• {e}" for e in sample)
     db.increment_digest_demo_clicks(tg_id)
     await callback.answer()
     left = DIGEST_DEMO_MAX_CLICKS - clicks - 1
     await callback.message.answer(
-        t(lang, "digest_demo_result", count=len(contacts), sample=lines)
+        t(lang, "digest_demo_result", count=len(emails), sample=lines)
         + "\n\n" + t(lang, "digest_demo_left", left=left)
     )
 
@@ -1887,11 +1934,15 @@ async def cmd_backup(message: Message):
 
 
 BACKUP_HOUR_UTC = int(os.getenv("BACKUP_HOUR_UTC", "3"))
+NIGHTLY_BACKUP_ENABLED = os.getenv("NIGHTLY_BACKUP_ENABLED", "false").lower() == "true"  # выключено — /backup вручную по-прежнему работает
 
 
 async def nightly_backup_worker(bot: Bot):
     """Раз в сутки, в BACKUP_HOUR_UTC (по умолчанию 3:00 UTC), сама присылает
     копию базы каждому админу — не нужно вспоминать про /backup вручную."""
+    if not NIGHTLY_BACKUP_ENABLED:
+        print("[nightly_backup_worker] Выключено (NIGHTLY_BACKUP_ENABLED=false)")
+        return
     last_sent_date = None
     while True:
         try:

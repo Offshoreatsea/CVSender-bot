@@ -94,6 +94,10 @@ def init_db():
             created_at TEXT
         )
     """)
+    app_cols = {r["name"] for r in conn.execute("PRAGMA table_info(applications)")}
+    for col, ddl in (("candidate_rank", "TEXT"), ("resume_filename", "TEXT"), ("resume_data", "BLOB")):
+        if col not in app_cols:
+            conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {ddl}")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS candidates (
@@ -108,6 +112,10 @@ def init_db():
             updated_at TEXT
         )
     """)
+    cand_cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+    for col, ddl in (("resume_filename", "TEXT"), ("resume_data", "BLOB")):
+        if col not in cand_cols:
+            conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} {ddl}")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -1087,16 +1095,33 @@ def search_published_vacancies(region: str = "", q: str = "", limit: int = 50):
     return rows
 
 
+def has_recent_application(candidate_tg_id: int, vacancy_id: int, minutes: int = 10) -> bool:
+    """Тот же человек только что откликался на эту же вакансию — не даём
+    заспамить админов повторными откликами на одну и ту же вакансию подряд."""
+    if not candidate_tg_id:
+        return False
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+    row = conn.execute(
+        "SELECT 1 FROM applications WHERE candidate_tg_id = ? AND vacancy_id = ? AND created_at > ?",
+        (candidate_tg_id, vacancy_id, cutoff),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def insert_application(vacancy_id: int, candidate_tg_id: int, candidate_name: str,
-                        candidate_username: str, contact: str, message: str) -> int:
+                        candidate_username: str, contact: str, message: str,
+                        candidate_rank: str = None, resume_filename: str = None,
+                        resume_data: bytes = None) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO applications
            (vacancy_id, candidate_tg_id, candidate_name, candidate_username,
-            contact, message, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            contact, message, created_at, candidate_rank, resume_filename, resume_data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (vacancy_id, candidate_tg_id, candidate_name, candidate_username,
-         contact, message, datetime.now().isoformat()),
+         contact, message, datetime.now().isoformat(), candidate_rank, resume_filename, resume_data),
     )
     conn.commit()
     app_id = cur.lastrowid
@@ -1144,8 +1169,8 @@ def upsert_candidate_profile(tg_id: int, fields: dict):
     conn.execute(
         """INSERT INTO candidates
            (tg_id, full_name, nationality, current_rank, vessel_types,
-            years_experience, availability, documents, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            years_experience, availability, documents, resume_filename, resume_data, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(tg_id) DO UPDATE SET
                full_name = excluded.full_name,
                nationality = excluded.nationality,
@@ -1154,12 +1179,15 @@ def upsert_candidate_profile(tg_id: int, fields: dict):
                years_experience = excluded.years_experience,
                availability = excluded.availability,
                documents = excluded.documents,
+               resume_filename = COALESCE(excluded.resume_filename, candidates.resume_filename),
+               resume_data = COALESCE(excluded.resume_data, candidates.resume_data),
                updated_at = excluded.updated_at""",
         (
             tg_id, fields.get("full_name"), fields.get("nationality"),
             fields.get("current_rank"), fields.get("vessel_types"),
             fields.get("years_experience"), fields.get("availability"),
-            fields.get("documents"), datetime.now().isoformat(),
+            fields.get("documents"), fields.get("resume_filename"), fields.get("resume_data"),
+            datetime.now().isoformat(),
         ),
     )
     conn.commit()

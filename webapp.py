@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 import stripe
+from aiogram.types import BufferedInputFile
 from aiohttp import web
 
 import db
@@ -75,6 +76,7 @@ def vacancy_to_dict(row) -> dict:
         "id": row["id"],
         "position": row["position"],
         "position_tag": row["position_tag"],
+        "fleet_tag": row["fleet_tag"],
         "vessel": row["vessel"],
         "vessel_tag": row["vessel_tag"],
         "region": row["region"],
@@ -221,14 +223,28 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             "vessel_types": row["vessel_types"],
             "years_experience": row["years_experience"],
             "availability": row["availability"],
-            "documents": row["documents"],
+            # resume_data (сам файл) никогда не отдаём обратно в мини-приложение —
+            # только имя файла, чтобы показать "резюме загружено: cv.pdf"
+            "resume_filename": row["resume_filename"] if "resume_filename" in row.keys() else None,
         })
 
     async def handle_post_profile(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid_json"}, status=400)
+        resume_filename, resume_data = None, None
+        if request.content_type == "multipart/form-data":
+            body = {}
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name == "resume" and part.filename:
+                    data = await part.read(decode=True)
+                    if data and len(data) <= 10 * 1024 * 1024:
+                        resume_filename, resume_data = part.filename[:200], data
+                else:
+                    body[part.name] = (await part.text()).strip()
+        else:
+            try:
+                body = await request.json()
+            except json.JSONDecodeError:
+                return web.json_response({"error": "invalid_json"}, status=400)
         tg_id = get_authenticated_tg_id(body.get("initData", ""))
         if tg_id is None:
             return web.json_response({"error": "invalid_init_data"}, status=403)
@@ -239,8 +255,11 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             "vessel_types": (body.get("vessel_types") or "").strip()[:300],
             "years_experience": (body.get("years_experience") or "").strip()[:20],
             "availability": (body.get("availability") or "").strip()[:50],
-            "documents": (body.get("documents") or "").strip()[:300],
+            "documents": "",  # поле заменено загрузкой резюме, текстом больше не используется
         }
+        if resume_data:
+            fields["resume_filename"] = resume_filename
+            fields["resume_data"] = resume_data
         db.upsert_candidate_profile(tg_id, fields)
         return web.json_response({"ok": True})
 
@@ -261,10 +280,25 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         ])
 
     async def handle_apply(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "invalid_json"}, status=400)
+        # multipart — чтобы вместе с полями формы можно было прислать и файл
+        # резюме одним запросом (обычный JSON этого не умеет)
+        resume_filename, resume_data = None, None
+        if request.content_type == "multipart/form-data":
+            fields = {}
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name == "resume" and part.filename:
+                    data = await part.read(decode=True)
+                    if data and len(data) <= 10 * 1024 * 1024:  # 10 МБ с запасом
+                        resume_filename, resume_data = part.filename[:200], data
+                else:
+                    fields[part.name] = (await part.text()).strip()
+            body = fields
+        else:
+            try:
+                body = await request.json()
+            except json.JSONDecodeError:
+                return web.json_response({"error": "invalid_json"}, status=400)
 
         init_data = body.get("initData", "")
         parsed = validate_init_data(init_data, bot_token)
@@ -276,28 +310,48 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         except json.JSONDecodeError:
             tg_user = {}
 
-        vacancy_id = body.get("vacancy_id")
-        contact = (body.get("contact") or "").strip()
-        message = (body.get("message") or "").strip()
-        name = (body.get("name") or tg_user.get("first_name") or "").strip()
+        try:
+            vacancy_id = int(body.get("vacancy_id"))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_vacancy_id"}, status=400)
+        # ограничиваем длину полей — initData подтверждает, что это реальный
+        # пользователь Telegram, но без этого он всё равно мог прислать
+        # сколько угодно текста в одном запросе
+        contact = (body.get("contact") or "").strip()[:300]
+        message = (body.get("message") or "").strip()[:1000]
+        name = (body.get("name") or tg_user.get("first_name") or "").strip()[:200]
+        rank = (body.get("rank") or "").strip()[:50]
 
-        if not vacancy_id or not contact:
+        if not contact:
             return web.json_response({"error": "missing_fields"}, status=400)
+        if not db.get_vacancy(vacancy_id):
+            return web.json_response({"error": "vacancy_not_found"}, status=404)
+        # один и тот же человек не должен засыпать админов повторными
+        # откликами на одну и ту же вакансию — initData не спасает от
+        # многократных НАСТОЯЩИХ запросов одного пользователя подряд
+        if db.has_recent_application(tg_user.get("id"), vacancy_id):
+            return web.json_response({"error": "duplicate_application"}, status=429)
 
         db.insert_application(
-            vacancy_id=int(vacancy_id),
+            vacancy_id=vacancy_id,
             candidate_tg_id=tg_user.get("id"),
             candidate_name=name,
             candidate_username=tg_user.get("username"),
             contact=contact,
             message=message,
+            candidate_rank=rank or None,
+            resume_filename=resume_filename,
+            resume_data=resume_data,
         )
 
-        vacancy = db.get_vacancy(int(vacancy_id))
+        vacancy = db.get_vacancy(vacancy_id)
         position = vacancy["position"] if vacancy else "вакансия"
         admin_ids = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}", f"Контакт: {contact}"]
+        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}"]
+        if rank:
+            notify_lines.append(f"Звание: {rank}")
+        notify_lines.append(f"Контакт: {contact}")
         if tg_user.get("username"):
             notify_lines.append(f"Telegram: @{tg_user['username']}")
         if message:
@@ -306,7 +360,14 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
 
         for admin_id in admin_ids:
             try:
-                await bot.send_message(chat_id=admin_id, text=notify_text)
+                if resume_data:
+                    await bot.send_document(
+                        chat_id=admin_id,
+                        document=BufferedInputFile(resume_data, filename=resume_filename or "resume"),
+                        caption=notify_text,
+                    )
+                else:
+                    await bot.send_message(chat_id=admin_id, text=notify_text)
             except Exception:
                 pass
 
