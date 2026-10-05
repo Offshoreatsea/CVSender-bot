@@ -924,16 +924,33 @@ def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: boo
 
 
 
+# Куда ведёт кнопка "I would like to send my cv to companies" — личка человека, который обрабатывает заказы рассылки резюме. Можно сменить без правки кода: CV_DIST_CONTACT_URL в Railway.
+CV_DIST_CONTACT_URL = os.getenv("CV_DIST_CONTACT_URL", "https://t.me/cvsenderforsea")
+
+
 @router.callback_query(F.data == "cvdist")
 async def cb_cv_distribution(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        "✉️ <b>CV Distribution</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="I would like to send my cv to companies", url="https://cv-sender.com")],
-            [InlineKeyboardButton(text="⬅️ Back to main menu", url=f"https://t.me/{BOT_USERNAME}?start=menu")],
-        ]),
-    )
+    # Эта кнопка висит под постами в САМОМ канале — callback.message там это
+    # пост канала, а не личка нажавшего. callback.message.answer() слал ответ
+    # в тот же чат, то есть публиковал это сообщение в канал всем 4000+
+    # подписчикам при каждом нажатии кем угодно. Нужно личным сообщением.
+    try:
+        await callback.bot.send_message(
+            callback.from_user.id,
+            "✉️ <b>CV Distribution</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="I would like to send my cv to companies", url=CV_DIST_CONTACT_URL)],
+                [InlineKeyboardButton(text="⬅️ Back to main menu", url=f"https://t.me/{BOT_USERNAME}?start=menu")],
+            ]),
+        )
+        await callback.answer()
+    except TelegramAPIError:
+        # бот ещё не может писать этому человеку — он не нажимал Start.
+        # Короткий алерт прямо на кнопке, без постов в канал.
+        await callback.answer(
+            f"Откройте @{BOT_USERNAME} и нажмите Start, чтобы получить это в личку",
+            show_alert=True,
+        )
 
 
 def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
