@@ -61,6 +61,9 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 TANKER_CHANNEL_USERNAME = os.getenv("TANKER_CHANNEL_USERNAME", "tankerjobatsea")
 TANKER_CHANNEL_ID = f"@{TANKER_CHANNEL_USERNAME}"
 TANKER_CHANNEL_LINK = os.getenv("TANKER_CHANNEL_LINK", f"https://t.me/{TANKER_CHANNEL_USERNAME}")
+# Ссылка в хвосте каждой вакансии (вместо ссылки на группу) и URL кнопки "Get More Offers"
+POST_FOOTER_LINK = os.getenv("POST_FOOTER_LINK", "https://t.me/EasyWayAtSea_bot")
+GET_MORE_OFFERS_URL = os.getenv("GET_MORE_OFFERS_URL", "https://www.wayatsea.com")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/cvsenderforsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -799,7 +802,7 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
         # в канал танкеров этот хвост не добавляем — ссылка вела бы на
         # ОСНОВНОЙ канал, что бессмысленно внутри другого канала
         parts.append("")
-        parts.append(f"🔗 {CHANNEL_LINK}")
+        parts.append(f"🔗 {POST_FOOTER_LINK}")
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -905,7 +908,7 @@ def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: boo
         # include_menu=True) её не шлём: он туда и так уже попал через бота,
         # кнопка там не нужна и выглядела как цикл "зайди туда, где уже есть"
         rows.append([InlineKeyboardButton(
-            text="🎯 Get More Offers", url=f"https://t.me/{BOT_USERNAME}?start=join"
+            text="🎯 Get More Offers", url=GET_MORE_OFFERS_URL
         )])
     rows.append([InlineKeyboardButton(text="✉️ CV Distribution", callback_data="cvdist")])
     if is_tanker:
