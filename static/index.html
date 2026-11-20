@@ -42,6 +42,7 @@ input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 0.5
   <p id="header-title" style="font-weight:600; font-size:17px; margin:0;">Jobs</p>
 </div>
 
+<div id="fleet-tabs" style="display:flex; gap:8px; padding:0 16px 8px; overflow-x:auto;"></div>
 <div id="chips" style="display:flex; gap:8px; padding:0 16px 12px; overflow-x:auto;"></div>
 <div id="search-wrap" style="padding:0 16px 8px;">
   <input id="searchInput" type="text" placeholder="Search position, vessel…">
@@ -72,15 +73,39 @@ const tg = window.Telegram ? window.Telegram.WebApp : null;
 if (tg) { tg.ready(); tg.expand(); }
 const initData = tg ? tg.initData : "";
 
-const DEPARTMENTS = {
-  "Bridge": ["Master","ChiefOfficer","SecondOfficer","ThirdOfficer","DeckCadet"],
-  "Engine": ["ChiefEngineer","SecondEngineer","ThirdEngineer","FourthEngineer","EngineCadet","ETO","Electrician"],
-  "Ratings": ["Bosun","AB","OS","Motorman","Oiler","Fitter"],
-  "Catering": ["Cook","Steward","Campboss","ChiefSteward"],
-  "Offshore & Specialist": ["CraneOperator","DPOperator","ROVPilot","Rigger","Welder","Scaffolder","ClientRepresentative","SafetyOfficer","Surveyor"]
+// Та же структура должностей, что и в самом боте (FLEETS в main.py) — три
+// флота, в каждом свои отделы. Один и тот же тег (например Master) существует
+// в нескольких флотах независимо, поэтому фильтр всегда идёт по ПАРЕ
+// (fleet_tag, position_tag), не по одному тегу.
+const FLEETS = {
+  merchant: { label: "⚓ Merchant", departments: {
+    "Bridge Officers": ["Master","ChiefOfficer","SecondOfficer","ThirdOfficer","JuniorOfficer"],
+    "Engine Officers": ["ChiefEngineer","SecondEngineer","ThirdEngineer","JuniorEngineer","RefEngineer","ETO","Electrician","GasEngineer"],
+    "Deck Ratings": ["Bosun","AB","OS","Fitter","Welder","DeckCadet"],
+    "Engine Ratings": ["Oiler","Wiper","Motorman","Fitter","Welder","EngineCadet"],
+    "Catering": ["Cook","NightCook","Steward","Messman","Baker"],
+  }},
+  offshore: { label: "🛠 Offshore", departments: {
+    "Bridge Officers": ["MasterSDPO","Master","ChiefOfficer","SecondOfficer","ThirdOfficer","SafetyOfficer","HLO"],
+    "Engine Officers": ["ChiefEngineer","SecondEngineer","ThirdEngineer","JuniorEngineer","ETO","Electrician","ElectricianAssistant"],
+    "Deck Ratings": ["AB","OS","Bosun","Roustabout","CraneOperator","GangwayOperator","HLO","Rigger","Fitter","Welder","DeckCadet"],
+    "Engine Ratings": ["Motorman","Oiler","Wiper","Fitter","Welder","EngineCadet"],
+    "Catering": ["Cook","NightCook","Campboss","Steward","ChiefSteward","Messman"],
+  }},
+  tanker: { label: "🛢 Tanker", departments: {
+    "Bridge Officers": ["Master","ChiefOfficer","SecondOfficer","ThirdOfficer","JuniorOfficer"],
+    "Engine Officers": ["ChiefEngineer","SecondEngineer","ThirdEngineer","JuniorEngineer","RefEngineer","ETO","Electrician","GasEngineer"],
+    "Deck Ratings": ["Bosun","AB","OS","Fitter","Welder","DeckCadet"],
+    "Engine Ratings": ["Oiler","Wiper","Motorman","Fitter","Welder","EngineCadet"],
+    "Catering": ["Cook","NightCook","Steward","Messman","Baker"],
+  }},
 };
+// Плоский список тегов для выпадающих списков (Rank в форме отклика и в
+// профиле) — там флот не выбирается отдельно, нужен весь набор без повторов
+const ALL_RANK_TAGS = [...new Set(Object.values(FLEETS).flatMap(f => Object.values(f.departments).flat()))];
 
 let allVacancies = [];
+let activeFleet = "all";
 let activeDept = "all";
 let currentTab = "jobs";
 
@@ -90,9 +115,30 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function renderFleetTabs() {
+  const wrap = document.getElementById("fleet-tabs");
+  const keys = ["all", ...Object.keys(FLEETS)];
+  wrap.innerHTML = keys.map(k =>
+    `<span class="chip tapscale${k===activeFleet ? " active" : ""}" data-f="${escapeHtml(k)}">${k === "all" ? "All fleets" : escapeHtml(FLEETS[k].label)}</span>`
+  ).join("");
+  wrap.querySelectorAll(".chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      activeFleet = chip.getAttribute("data-f");
+      activeDept = "all";  // при смене флота сбрасываем отдел — в другом флоте он может не существовать
+      renderFleetTabs();
+      renderChips();
+      renderJobsList();
+    });
+  });
+}
+
 function renderChips() {
   const wrap = document.getElementById("chips");
-  const depts = ["all", ...Object.keys(DEPARTMENTS)];
+  if (activeFleet === "all") {
+    wrap.innerHTML = "";
+    return;
+  }
+  const depts = ["all", ...Object.keys(FLEETS[activeFleet].departments)];
   wrap.innerHTML = depts.map(d =>
     `<span class="chip tapscale${d===activeDept ? " active" : ""}" data-d="${escapeHtml(d)}">${d === "all" ? "All" : escapeHtml(d)}</span>`
   ).join("");
@@ -106,8 +152,10 @@ function renderChips() {
 }
 
 function matchesDept(v) {
-  if (activeDept === "all") return true;
-  const tags = DEPARTMENTS[activeDept] || [];
+  // fleet_tag с бэкенда — "Merchant"/"Offshore"/"Tanker", ключ вкладки — то же в нижнем регистре
+  if (activeFleet !== "all" && (v.fleet_tag || "").toLowerCase() !== activeFleet) return false;
+  if (activeDept === "all" || activeFleet === "all") return true;
+  const tags = FLEETS[activeFleet].departments[activeDept] || [];
   return tags.includes(v.position_tag);
 }
 
@@ -172,25 +220,39 @@ function renderApplyForm(vacancyId) {
   const area = document.getElementById("apply-area");
   area.innerHTML = `
     <input id="ap-name" type="text" placeholder="Your name">
+    <select id="ap-rank">${rankOptionsHtml("")}</select>
     <input id="ap-contact" type="text" placeholder="Email or phone to contact you">
+    <input id="ap-phone" type="text" placeholder="Phone">
     <input id="ap-message" type="text" placeholder="Message (optional)">
+    <label style="display:block; font-size:12px; color:var(--hint); margin-bottom:4px;">Resume (optional)</label>
+    <input id="ap-resume" type="file" accept=".pdf,.doc,.docx" style="margin-bottom:10px;">
     <p id="ap-status" style="font-size:13px; color:var(--hint); min-height:16px; margin:0 0 8px;"></p>
     <button class="primary-btn tapscale" id="ap-submit">Apply</button>
   `;
   document.getElementById("ap-submit").addEventListener("click", async () => {
     const name = document.getElementById("ap-name").value.trim();
+    const rank = document.getElementById("ap-rank").value;
     const contact = document.getElementById("ap-contact").value.trim();
+    const phone = document.getElementById("ap-phone").value.trim();
     const message = document.getElementById("ap-message").value.trim();
+    const resumeFile = document.getElementById("ap-resume").files[0];
     const statusEl = document.getElementById("ap-status");
     if (!contact) {
       statusEl.textContent = "Enter an email or phone number to contact you.";
       return;
     }
+    const fd = new FormData();
+    fd.append("initData", initData);
+    fd.append("vacancy_id", vacancyId);
+    fd.append("name", name);
+    fd.append("rank", rank);
+    // телефон отдельным полем не хранится на бэкенде — приписываем к контакту,
+    // чтобы не терять, если контакт выше это email
+    fd.append("contact", phone && contact !== phone ? `${contact}, ${phone}` : contact);
+    fd.append("message", message);
+    if (resumeFile) fd.append("resume", resumeFile, resumeFile.name);
     try {
-      const res = await fetch("/api/apply", {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ initData, vacancy_id: vacancyId, name, contact, message })
-      });
+      const res = await fetch("/api/apply", { method: "POST", body: fd });
       if (res.ok) {
         statusEl.textContent = "Application sent ✓";
         document.getElementById("ap-submit").disabled = true;
@@ -230,14 +292,10 @@ async function loadApplications() {
 }
 
 function rankOptionsHtml(current) {
-  let html = '<option value="">Select…</option>';
-  for (const dept in DEPARTMENTS) {
-    html += `<optgroup label="${escapeHtml(dept)}">`;
-    DEPARTMENTS[dept].forEach(tag => {
-      html += `<option value="${tag}"${tag === current ? " selected" : ""}>${tag}</option>`;
-    });
-    html += "</optgroup>";
-  }
+  let html = '<option value="">Select rank…</option>';
+  ALL_RANK_TAGS.forEach(tag => {
+    html += `<option value="${tag}"${tag === current ? " selected" : ""}>${tag}</option>`;
+  });
   return html;
 }
 
@@ -266,8 +324,9 @@ function renderProfileView(profile) {
         <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Nationality</span><span style="font-size:13px;">${escapeHtml(profile.nationality || "—")}</span></div>
         <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Rank</span><span style="font-size:13px;">${escapeHtml(profile.current_rank || "—")}</span></div>
         <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Vessel types</span><span style="font-size:13px; text-align:right;">${escapeHtml(profile.vessel_types || "—")}</span></div>
-        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Experience</span><span style="font-size:13px;">${escapeHtml(profile.years_experience || "—")} yrs</span></div>
-        <div class="row" style="padding:10px 0;"><span style="color:var(--hint); font-size:13px;">Available</span><span style="font-size:13px;">${escapeHtml(profile.availability || "—")}</span></div>
+        <div class="row" style="padding:10px 0; border-bottom:0.5px solid var(--divider);"><span style="color:var(--hint); font-size:13px;">Years of experience in Rank</span><span style="font-size:13px;">${escapeHtml(profile.years_experience || "—")} yrs</span></div>
+        <div class="row" style="padding:10px 0; ${profile.resume_filename ? 'border-bottom:0.5px solid var(--divider);' : ''}"><span style="color:var(--hint); font-size:13px;">Available from</span><span style="font-size:13px;">${escapeHtml(profile.availability || "—")}</span></div>
+        ${profile.resume_filename ? `<div class="row" style="padding:10px 0;"><span style="color:var(--hint); font-size:13px;">Resume</span><span style="font-size:13px;">📎 ${escapeHtml(profile.resume_filename)}</span></div>` : ""}
       </div>
       <button class="primary-btn tapscale" id="edit-profile-btn">Edit profile</button>
     `;
@@ -278,41 +337,43 @@ function renderProfileView(profile) {
 function renderProfileForm(profile) {
   profile = profile || {};
   const el = document.getElementById("s-profile");
+  // Availability теперь дата (с какого числа доступен), а не "сейчас/по контракту" —
+  // если в данных лежит старое текстовое значение, календарь просто откроется пустым
+  const availDate = /^\d{4}-\d{2}-\d{2}$/.test(profile.availability || "") ? profile.availability : "";
   el.innerHTML = `
     <input id="pf-name" type="text" placeholder="Full name" value="${escapeHtml(profile.full_name || "")}">
     <input id="pf-nat" type="text" placeholder="Nationality" value="${escapeHtml(profile.nationality || "")}">
     <select id="pf-rank">${rankOptionsHtml(profile.current_rank || "")}</select>
     <input id="pf-vessels" type="text" placeholder="Vessel types (e.g. Tanker, OSV)" value="${escapeHtml(profile.vessel_types || "")}">
-    <input id="pf-exp" type="text" placeholder="Years of experience" value="${escapeHtml(profile.years_experience || "")}">
-    <select id="pf-avail">
-      <option value="">Availability…</option>
-      <option value="Available now"${profile.availability === "Available now" ? " selected" : ""}>Available now</option>
-      <option value="On contract"${profile.availability === "On contract" ? " selected" : ""}>On contract</option>
-    </select>
-    <input id="pf-docs" type="text" placeholder="Certificates (e.g. STCW, BOSIET)" value="${escapeHtml(profile.documents || "")}">
+    <input id="pf-exp" type="text" placeholder="Years of experience in Rank" value="${escapeHtml(profile.years_experience || "")}">
+    <label style="display:block; font-size:12px; color:var(--hint); margin-bottom:4px;">Available from</label>
+    <input id="pf-avail" type="date" value="${escapeHtml(availDate)}">
+    <label style="display:block; font-size:12px; color:var(--hint); margin-bottom:4px;">Resume</label>
+    ${profile.resume_filename ? `<p style="font-size:13px; margin:0 0 6px;">📎 ${escapeHtml(profile.resume_filename)} (uploaded)</p>` : ""}
+    <input id="pf-resume" type="file" accept=".pdf,.doc,.docx" style="margin-bottom:10px;">
     <p id="pf-status" style="font-size:13px; color:var(--hint); min-height:16px;"></p>
     <button class="primary-btn tapscale" id="pf-save">Save profile</button>
   `;
   document.getElementById("pf-save").addEventListener("click", async () => {
-    const fields = {
-      full_name: document.getElementById("pf-name").value.trim(),
-      nationality: document.getElementById("pf-nat").value.trim(),
-      current_rank: document.getElementById("pf-rank").value,
-      vessel_types: document.getElementById("pf-vessels").value.trim(),
-      years_experience: document.getElementById("pf-exp").value.trim(),
-      availability: document.getElementById("pf-avail").value,
-      documents: document.getElementById("pf-docs").value.trim(),
-    };
+    const full_name = document.getElementById("pf-name").value.trim();
+    const current_rank = document.getElementById("pf-rank").value;
     const statusEl = document.getElementById("pf-status");
-    if (!fields.full_name || !fields.current_rank) {
+    if (!full_name || !current_rank) {
       statusEl.textContent = "Enter your name and rank at least.";
       return;
     }
+    const fd = new FormData();
+    fd.append("initData", initData);
+    fd.append("full_name", full_name);
+    fd.append("nationality", document.getElementById("pf-nat").value.trim());
+    fd.append("current_rank", current_rank);
+    fd.append("vessel_types", document.getElementById("pf-vessels").value.trim());
+    fd.append("years_experience", document.getElementById("pf-exp").value.trim());
+    fd.append("availability", document.getElementById("pf-avail").value);
+    const resumeFile = document.getElementById("pf-resume").files[0];
+    if (resumeFile) fd.append("resume", resumeFile, resumeFile.name);
     try {
-      const res = await fetch("/api/profile", {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ initData, ...fields })
-      });
+      const res = await fetch("/api/profile", { method: "POST", body: fd });
       if (res.ok) { loadProfile(); } else { statusEl.textContent = "Couldn't save, please try again."; }
     } catch (e) {
       statusEl.textContent = "Couldn't save, check your connection.";
@@ -322,6 +383,7 @@ function renderProfileForm(profile) {
 
 function showScreen(name) {
   document.getElementById("s-jobs").classList.toggle("hidden", name !== "jobs");
+  document.getElementById("fleet-tabs").classList.toggle("hidden", name !== "jobs");
   document.getElementById("chips").classList.toggle("hidden", name !== "jobs");
   document.getElementById("search-wrap").classList.toggle("hidden", name !== "jobs");
   document.getElementById("s-applications").classList.toggle("hidden", name !== "applications");
@@ -347,6 +409,7 @@ document.querySelectorAll(".navbtn").forEach(btn => {
 
 document.getElementById("searchInput").addEventListener("input", renderJobsList);
 
+renderFleetTabs();
 renderChips();
 loadVacancies();
 </script>

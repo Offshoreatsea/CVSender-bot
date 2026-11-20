@@ -1,18 +1,50 @@
 import os
+import random
 import sqlite3
+import time
 from datetime import datetime, timedelta
 
 DB_PATH = os.getenv("DB_PATH") or "bot.db"
 
 
+class _RetryConnection(sqlite3.Connection):
+    """Соединение, которое повторяет операцию при "database is locked".
+    В боте одновременно пишут хендлеры, воркеры (скрейперы, рассылки, почта)
+    и веб-сервер, а у SQLite один писатель за раз. Даже с WAL и busy_timeout
+    он иногда отказывает мгновенно, минуя ожидание — короткий повтор это лечит.
+    Повтор безопасен: упавший запрос не применился."""
+
+    def _retry(self, fn, *args, **kwargs):
+        for attempt in range(8):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1) + random.random() * 0.05)
+
+    def execute(self, *args, **kwargs):
+        return self._retry(super().execute, *args, **kwargs)
+
+    def commit(self):
+        return self._retry(super().commit)
+
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout/busy_timeout: ждать освобождения блокировки до 30 с вместо
+    # стандартных 5 с (из-за них и падало "database is locked")
+    conn = sqlite3.connect(DB_PATH, timeout=30, factory=_RetryConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")  # безопасно вместе с WAL, заметно быстрее
     return conn
 
 
 def init_db():
     conn = get_conn()
+    # WAL: читатели не блокируют писателя и наоборот. Режим сохраняется в
+    # самом файле базы, достаточно включить один раз при старте
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vacancies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,9 +69,18 @@ def init_db():
     # миграция для уже существующих баз (добавились salary/documents/nationality/duration/notes/raw_text)
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vacancies)")}
     for col in ("salary", "documents", "nationality", "duration", "notes", "raw_text",
-                "position_tag", "vessel_tag"):
+                "position_tag", "vessel_tag", "fleet_tag", "source", "source_url"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} TEXT")
+
+    # просмотренные посты LinkedIn — чтобы один и тот же пост не приходил повторно
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS linkedin_seen (
+            post_id TEXT PRIMARY KEY,
+            seen_at TEXT,
+            verdict TEXT
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS corrections (
@@ -62,6 +103,10 @@ def init_db():
             created_at TEXT
         )
     """)
+    app_cols = {r["name"] for r in conn.execute("PRAGMA table_info(applications)")}
+    for col, ddl in (("candidate_rank", "TEXT"), ("resume_filename", "TEXT"), ("resume_data", "BLOB")):
+        if col not in app_cols:
+            conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {ddl}")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS candidates (
@@ -76,6 +121,10 @@ def init_db():
             updated_at TEXT
         )
     """)
+    cand_cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+    for col, ddl in (("resume_filename", "TEXT"), ("resume_data", "BLOB")):
+        if col not in cand_cols:
+            conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} {ddl}")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -106,6 +155,16 @@ def init_db():
         conn.execute("ALTER TABLE subscribers ADD COLUMN referred_by INTEGER")
     if "reminder_sent_for" not in sub_cols:
         conn.execute("ALTER TABLE subscribers ADD COLUMN reminder_sent_for TEXT")
+    if "stripe_customer_id" not in sub_cols:
+        # нужен, чтобы: 1) автоматически продлевать доступ при ежемесячном
+        # списании Stripe (webhook invoice.payment_succeeded не содержит
+        # tg_id напрямую — только customer_id), и 2) генерировать ссылку на
+        # Customer Portal для самостоятельной отмены подписки
+        conn.execute("ALTER TABLE subscribers ADD COLUMN stripe_customer_id TEXT")
+    if "digest_demo_clicks" not in sub_cols:
+        # лимит на бесплатное демо "5 случайных email" — иначе можно нажимать
+        # его бесконечно и по кусочкам выкачать весь список бесплатно
+        conn.execute("ALTER TABLE subscribers ADD COLUMN digest_demo_clicks INTEGER DEFAULT 0")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -144,6 +203,64 @@ def init_db():
             "INSERT OR IGNORE INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
             (row["tg_id"], row["position_tag"], datetime.now().isoformat()),
         )
+    sub_cols = [r["name"] for r in conn.execute("PRAGMA table_info(subscriptions)")]
+    if "active" not in sub_cols:
+        # снятие должности больше не удаляет строку целиком — иначе теряется
+        # история "уже получал бэкфилл по этой должности", и человек мог бы
+        # выкачивать вакансии по кругу (снял → выбрал снова → получил
+        # бэкфилл заново). Активные подписки — active=1
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN active INTEGER DEFAULT 1")
+    if "backfill_sent" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN backfill_sent INTEGER DEFAULT 0")
+    if "fleet_tag" not in sub_cols:
+        # флот теперь отдельное поле, а не суффикс в самом теге — одна и та
+        # же должность (например "Master") выбирается независимо в каждом
+        # из трёх флотов. PRIMARY KEY у старой таблицы был (tg_id,
+        # position_tag) — этого мало (не даст выбрать "Master" сразу в двух
+        # флотах), поэтому пересобираем таблицу целиком, разбирая старые
+        # суффиксные теги (ChiefEngineerOffshore → ChiefEngineer + Offshore)
+        _OLD_SUFFIX_TO_FLEET = [("Offshore", "Offshore"), ("Tanker", "Tanker")]
+        _OLD_DPO_TAGS = {
+            "MasterSDPO": "Offshore", "ChiefOfficerDPO": "Offshore",
+            "SecondOfficerDPO": "Offshore", "ThirdOfficerJDPO": "Offshore",
+        }
+        _OFFSHORE_ONLY = {  # теги, которые и раньше не имели суффикса, но были только офшорными
+            "SafetyOfficer", "HLO", "Roustabout", "CraneOperator", "GangwayOperator",
+            "Rigger", "Campboss", "ChiefSteward", "ROVPilot", "ClientRepresentative",
+            "OnlineSurvey", "SurveyEngineer", "Diver", "Scaffolder", "WinchOperator",
+        }
+        old_rows = conn.execute("SELECT * FROM subscriptions").fetchall()
+        conn.execute("ALTER TABLE subscriptions RENAME TO subscriptions_old")
+        conn.execute("""
+            CREATE TABLE subscriptions (
+                tg_id INTEGER,
+                position_tag TEXT,
+                fleet_tag TEXT,
+                subscribed_at TEXT,
+                active INTEGER DEFAULT 1,
+                backfill_sent INTEGER DEFAULT 0,
+                PRIMARY KEY (tg_id, position_tag, fleet_tag)
+            )
+        """)
+        for row in old_rows:
+            old_tag = row["position_tag"]
+            if old_tag in _OLD_DPO_TAGS:
+                new_tag, fleet = old_tag, _OLD_DPO_TAGS[old_tag]
+            elif old_tag in _OFFSHORE_ONLY:
+                new_tag, fleet = old_tag, "Offshore"
+            else:
+                new_tag, fleet = old_tag, "Merchant"
+                for suffix, fleet_name in _OLD_SUFFIX_TO_FLEET:
+                    if old_tag.endswith(suffix):
+                        new_tag, fleet = old_tag[: -len(suffix)], fleet_name
+                        break
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions "
+                "(tg_id, position_tag, fleet_tag, subscribed_at, active, backfill_sent) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (row["tg_id"], new_tag, fleet, row["subscribed_at"], row["active"], row["backfill_sent"]),
+            )
+        conn.execute("DROP TABLE subscriptions_old")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS click_events (
@@ -152,6 +269,135 @@ def init_db():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_vacancy_log (
+            tg_id INTEGER,
+            vacancy_id INTEGER,
+            sent_at TEXT,
+            PRIMARY KEY (tg_id, vacancy_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT,
+            time_hhmm TEXT,
+            text TEXT,
+            active INTEGER DEFAULT 1,
+            last_sent_date TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS external_jobs_seen (
+            source TEXT,
+            external_id TEXT,
+            seen_at TEXT,
+            PRIMARY KEY (source, external_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def is_external_job_seen(source: str, external_id: str) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM external_jobs_seen WHERE source = ? AND external_id = ?",
+        (source, external_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_external_job_seen(source: str, external_id: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO external_jobs_seen (source, external_id, seen_at) VALUES (?, ?, ?)",
+        (source, external_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def has_any_external_jobs_seen(source: str) -> bool:
+    """Был ли для этого источника хоть один запуск раньше — используется,
+    чтобы отличить самый первый проход (когда страница листинга сайта может
+    содержать вакансии за несколько прошлых дней, а не только новые) от
+    всех последующих, обычных проходов."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM external_jobs_seen WHERE source = ? LIMIT 1", (source,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def add_scheduled_ad(channel: str, time_hhmm: str, text: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO scheduled_ads (channel, time_hhmm, text, active) VALUES (?, ?, ?, 1)",
+        (channel, time_hhmm, text),
+    )
+    conn.commit()
+    ad_id = cur.lastrowid
+    conn.close()
+    return ad_id
+
+
+def list_scheduled_ads():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM scheduled_ads ORDER BY time_hhmm").fetchall()
+    conn.close()
+    return rows
+
+
+def delete_scheduled_ad(ad_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM scheduled_ads WHERE id = ?", (ad_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_due_ads(current_hhmm: str, today: str):
+    """Реклама, время которой наступило и которая ещё не отправлялась
+    сегодня — планировщик вызывает это раз в минуту."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM scheduled_ads
+           WHERE active = 1 AND time_hhmm = ?
+             AND (last_sent_date IS NULL OR last_sent_date != ?)""",
+        (current_hhmm, today),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_ad_sent_today(ad_id: int, today: str):
+    conn = get_conn()
+    conn.execute("UPDATE scheduled_ads SET last_sent_date = ? WHERE id = ?", (today, ad_id))
+    conn.commit()
+    conn.close()
+
+
+def was_vacancy_sent(tg_id: int, vacancy_id: int) -> bool:
+    """Гарантия на уровне вакансии (а не только тега): человек не должен
+    получить одну и ту же вакансию дважды, даже если пере-подписался, снял
+    и выбрал должность заново, или ему продлили доступ. Проверяется перед
+    ЛЮБОЙ личной отправкой вакансии (бэкфилл и обычное уведомление)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM sent_vacancy_log WHERE tg_id = ? AND vacancy_id = ?", (tg_id, vacancy_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_vacancy_sent(tg_id: int, vacancy_id: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_vacancy_log (tg_id, vacancy_id, sent_at) VALUES (?, ?, ?)",
+        (tg_id, vacancy_id, datetime.now().isoformat()),
+    )
     conn.commit()
     conn.close()
 
@@ -192,8 +438,8 @@ def insert_vacancy(fields: dict, dedup_key: str, raw_text: str = "") -> int:
         """INSERT INTO vacancies
            (position, vessel, region, nationality, dates, duration, rotation, salary,
             documents, contact, requirements, notes, hashtags, position_tag, vessel_tag,
-            dedup_key, raw_text, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+            fleet_tag, dedup_key, raw_text, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
         (
             fields.get("position"), fields.get("vessel"), fields.get("region"),
             fields.get("nationality"), fields.get("date"), fields.get("duration"),
@@ -203,7 +449,7 @@ def insert_vacancy(fields: dict, dedup_key: str, raw_text: str = "") -> int:
             "\n".join(fields.get("requirements") or []),
             fields.get("notes"),
             fields.get("hashtags"),
-            fields.get("position_tag"), fields.get("vessel_tag"),
+            fields.get("position_tag"), fields.get("vessel_tag"), fields.get("fleet_tag"),
             dedup_key, raw_text, datetime.now().isoformat(),
         ),
     )
@@ -364,8 +610,16 @@ def is_subscription_active(tg_id: int) -> bool:
 def extend_subscription(tg_id: int, days: int):
     """Продлевает платную подписку на N дней от текущего момента (или от
     даты истечения, если она ещё не прошла — чтобы досрочная повторная
-    оплата не сгорала впустую)."""
+    оплата не сгорала впустую). Сама гарантирует, что строка подписчика
+    существует — раньше это был обычный UPDATE, и если человек писал
+    /subscribe первым делом, ни разу не пройдя /start, строки ещё не было,
+    UPDATE молча ничего не менял, и триал считался выданным, а на деле
+    не сохранялся вообще."""
     conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO subscribers (tg_id, subscribed_at) VALUES (?, ?)",
+        (tg_id, datetime.now().isoformat()),
+    )
     row = conn.execute(
         "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
     ).fetchone()
@@ -382,6 +636,74 @@ def extend_subscription(tg_id: int, days: int):
     conn.commit()
     conn.close()
     return new_until
+
+
+def revoke_subscription(tg_id: int):
+    """Немедленно прекращает доступ (используется при возврате оплаты —
+    /refund раньше отмечал платёж возвращённым, но саму подписку не трогал,
+    и доступ оставался активным до прежней даты окончания)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?",
+        (datetime.now().isoformat(), tg_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_stripe_customer_id(tg_id: int, customer_id: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET stripe_customer_id = ? WHERE tg_id = ?", (customer_id, tg_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_tg_id_by_stripe_customer(customer_id: str) -> int | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT tg_id FROM subscribers WHERE stripe_customer_id = ?", (customer_id,)
+    ).fetchone()
+    conn.close()
+    return row["tg_id"] if row else None
+
+
+def get_digest_demo_clicks(tg_id: int) -> int:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT digest_demo_clicks FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["digest_demo_clicks"] if row and row["digest_demo_clicks"] else 0
+
+
+def increment_digest_demo_clicks(tg_id: int):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET digest_demo_clicks = COALESCE(digest_demo_clicks, 0) + 1 WHERE tg_id = ?",
+        (tg_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stripe_customer_id(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT stripe_customer_id FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["stripe_customer_id"] if row else None
+
+
+def get_subscription_until(tg_id: int) -> str | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT subscription_until FROM subscribers WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
+    conn.close()
+    return row["subscription_until"] if row else None
 
 
 def start_trial_if_new(tg_id: int, days: int) -> bool:
@@ -436,6 +758,18 @@ def revoke_subscription(tg_id: int):
     conn.execute("UPDATE subscribers SET subscription_until = ? WHERE tg_id = ?", (past, tg_id))
     conn.commit()
     conn.close()
+
+
+def payment_exists(charge_id: str) -> bool:
+    """Stripe (и, реже, Stars) может доставить уведомление об одном и том же
+    платеже больше одного раза — без этой проверки подписка продлевалась и
+    реферальный бонус начислялся за каждую повторную доставку одного charge_id."""
+    if not charge_id:
+        return False
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM payments WHERE charge_id = ?", (charge_id,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def insert_payment(tg_id: int, amount: float, days: int, charge_id: str,
@@ -588,89 +922,135 @@ def get_subscribers_list():
     result = []
     for s in subs:
         positions = conn.execute(
-            "SELECT position_tag FROM subscriptions WHERE tg_id = ?", (s["tg_id"],)
+            "SELECT position_tag, fleet_tag FROM subscriptions WHERE tg_id = ? AND active = 1",
+            (s["tg_id"],),
         ).fetchall()
         result.append({
             "tg_id": s["tg_id"],
             "username": s["username"],
             "language": s["language"],
             "subscription_until": s["subscription_until"],
-            "positions": [p["position_tag"] for p in positions],
+            "positions": [f"{p['position_tag']} ({p['fleet_tag']})" for p in positions],
         })
     conn.close()
     return result
 
 
-def toggle_subscription(tg_id: int, position_tag: str) -> bool:
-    """Переключает подписку на должность (добавляет, если не было — убирает,
-    если уже была). Возвращает True, если после вызова подписка ДОБАВЛЕНА
-    (значит нужно прислать бэкфилл), False — если снята."""
+def toggle_subscription(tg_id: int, position_tag: str, fleet_tag: str) -> tuple[bool, bool]:
+    """Переключает подписку на должность В КОНКРЕТНОМ ФЛОТЕ (одна и та же
+    должность, например Master, выбирается в Merchant/Tanker/Offshore
+    независимо — это разные подписки). Строка не удаляется при снятии —
+    сохраняем историю, чтобы не слать бэкфилл повторно при повторном
+    включении той же должности.
+    Возвращает (is_active, should_send_backfill)."""
     conn = get_conn()
     existing = conn.execute(
-        "SELECT 1 FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
+        "SELECT active, backfill_sent FROM subscriptions WHERE tg_id = ? AND position_tag = ? AND fleet_tag = ?",
+        (tg_id, position_tag, fleet_tag),
     ).fetchone()
-    if existing:
+    if existing is None:
         conn.execute(
-            "DELETE FROM subscriptions WHERE tg_id = ? AND position_tag = ?", (tg_id, position_tag)
+            "INSERT INTO subscriptions (tg_id, position_tag, fleet_tag, subscribed_at, active, backfill_sent) "
+            "VALUES (?, ?, ?, ?, 1, 1)",
+            (tg_id, position_tag, fleet_tag, datetime.now().isoformat()),
         )
-        added = False
-    else:
-        conn.execute(
-            "INSERT INTO subscriptions (tg_id, position_tag, subscribed_at) VALUES (?, ?, ?)",
-            (tg_id, position_tag, datetime.now().isoformat()),
-        )
-        added = True
+        conn.commit()
+        conn.close()
+        return True, True
+    new_active = 0 if existing["active"] else 1
+    should_backfill = bool(new_active) and not existing["backfill_sent"]
+    conn.execute(
+        "UPDATE subscriptions SET active = ?, backfill_sent = backfill_sent OR ? "
+        "WHERE tg_id = ? AND position_tag = ? AND fleet_tag = ?",
+        (new_active, 1 if should_backfill else 0, tg_id, position_tag, fleet_tag),
+    )
     conn.commit()
     conn.close()
-    return added
+    return bool(new_active), should_backfill
 
 
-def get_subscriber_positions(tg_id: int) -> list[str]:
+def get_subscriber_positions(tg_id: int) -> list[tuple[str, str]]:
+    """Возвращает список (position_tag, fleet_tag) — та же должность в
+    разных флотах теперь считается разными подписками."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT position_tag FROM subscriptions WHERE tg_id = ? ORDER BY position_tag", (tg_id,)
+        "SELECT position_tag, fleet_tag FROM subscriptions WHERE tg_id = ? AND active = 1 "
+        "ORDER BY fleet_tag, position_tag",
+        (tg_id,),
     ).fetchall()
     conn.close()
-    return [r["position_tag"] for r in rows]
+    return [(r["position_tag"], r["fleet_tag"]) for r in rows]
+
+
+def clear_subscriber_positions(tg_id: int, fleet_tag: str | None = None):
+    """Снимает текущие должности подписчика — используется админской
+    командой /setposition для ручной смены выбора в обход обычной
+    блокировки. Если fleet_tag не указан — снимает во ВСЕХ флотах."""
+    conn = get_conn()
+    if fleet_tag:
+        conn.execute("DELETE FROM subscriptions WHERE tg_id = ? AND fleet_tag = ?", (tg_id, fleet_tag))
+    else:
+        conn.execute("DELETE FROM subscriptions WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
 
 
 def subscriber_stats():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) c FROM subscribers").fetchone()["c"]
     by_tag = conn.execute(
-        """SELECT position_tag AS tag, COUNT(*) c
-           FROM subscriptions GROUP BY tag ORDER BY c DESC"""
+        """SELECT position_tag || ' (' || fleet_tag || ')' AS tag, COUNT(*) c
+           FROM subscriptions WHERE active = 1 GROUP BY position_tag, fleet_tag ORDER BY c DESC"""
     ).fetchall()
     conn.close()
     return total, by_tag
 
 
-def get_subscribers_for_tag(position_tag: str):
-    # рассылка вакансий — платная фича: шлём только тем, у кого подписка
-    # ещё не истекла, а не всем, кто когда-либо выбирал эту должность
+def get_subscribers_for_tag(position_tag: str, fleet_tag: str):
+    # вакансии шлём ВСЕМ, кто когда-либо выбрал эту должность В ЭТОМ ФЛОТЕ и
+    # не снял её — независимо от того, активна ли у них сейчас подписка/
+    # триал. Оплата решает только видимость контакта внутри самой вакансии
+    # (см. hide_contact в main.py), а не сам факт получения вакансий.
+    # Блокировку (/blockuser) по-прежнему уважаем.
     conn = get_conn()
     rows = conn.execute(
-        """SELECT subscriptions.tg_id FROM subscriptions
+        """SELECT DISTINCT subscriptions.tg_id FROM subscriptions
            JOIN subscribers ON subscribers.tg_id = subscriptions.tg_id
-           WHERE subscriptions.position_tag = ?
-             AND subscribers.subscription_until IS NOT NULL
-             AND subscribers.subscription_until > ?""",
-        (position_tag, datetime.now().isoformat()),
+           WHERE subscriptions.position_tag = ? AND subscriptions.fleet_tag = ?
+             AND subscriptions.active = 1
+             AND (subscribers.is_blocked IS NULL OR subscribers.is_blocked = 0)""",
+        (position_tag, fleet_tag),
     ).fetchall()
     conn.close()
     return [r["tg_id"] for r in rows]
 
 
-def get_recent_published_by_tag(position_tag: str, days: int = 7):
-    """Бэкфилл для новых подписчиков — опубликованные вакансии этой должности
-    за последние `days` суток, от старых к новым."""
+def get_recent_published_by_tag(position_tag: str, fleet_tag: str, days: int = 7):
+    """Бэкфилл для новых подписчиков — опубликованные вакансии этой
+    должности В ЭТОМ ФЛОТЕ за последние `days` суток, от старых к новым."""
     conn = get_conn()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     rows = conn.execute(
         """SELECT * FROM vacancies
-           WHERE status = 'published' AND position_tag = ? AND created_at > ?
+           WHERE status = 'published' AND position_tag = ? AND fleet_tag = ? AND created_at > ?
            ORDER BY created_at ASC""",
-        (position_tag, cutoff),
+        (position_tag, fleet_tag, cutoff),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_recent_published(days: int = 7):
+    """Все опубликованные вакансии за `days` суток, от старых к новым — без
+    фильтра по должности/флоту (для email_apply.py: фильтрация по клиенту
+    делается в коде через ranks.matches(), т.к. там нужна ещё и семья
+    должностей, а не только точный тег)."""
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT * FROM vacancies WHERE status = 'published' AND created_at > ?
+           ORDER BY created_at ASC""",
+        (cutoff,),
     ).fetchall()
     conn.close()
     return rows
@@ -724,16 +1104,33 @@ def search_published_vacancies(region: str = "", q: str = "", limit: int = 50):
     return rows
 
 
+def has_recent_application(candidate_tg_id: int, vacancy_id: int, minutes: int = 10) -> bool:
+    """Тот же человек только что откликался на эту же вакансию — не даём
+    заспамить админов повторными откликами на одну и ту же вакансию подряд."""
+    if not candidate_tg_id:
+        return False
+    conn = get_conn()
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+    row = conn.execute(
+        "SELECT 1 FROM applications WHERE candidate_tg_id = ? AND vacancy_id = ? AND created_at > ?",
+        (candidate_tg_id, vacancy_id, cutoff),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def insert_application(vacancy_id: int, candidate_tg_id: int, candidate_name: str,
-                        candidate_username: str, contact: str, message: str) -> int:
+                        candidate_username: str, contact: str, message: str,
+                        candidate_rank: str = None, resume_filename: str = None,
+                        resume_data: bytes = None) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO applications
            (vacancy_id, candidate_tg_id, candidate_name, candidate_username,
-            contact, message, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            contact, message, created_at, candidate_rank, resume_filename, resume_data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (vacancy_id, candidate_tg_id, candidate_name, candidate_username,
-         contact, message, datetime.now().isoformat()),
+         contact, message, datetime.now().isoformat(), candidate_rank, resume_filename, resume_data),
     )
     conn.commit()
     app_id = cur.lastrowid
@@ -781,8 +1178,8 @@ def upsert_candidate_profile(tg_id: int, fields: dict):
     conn.execute(
         """INSERT INTO candidates
            (tg_id, full_name, nationality, current_rank, vessel_types,
-            years_experience, availability, documents, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            years_experience, availability, documents, resume_filename, resume_data, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(tg_id) DO UPDATE SET
                full_name = excluded.full_name,
                nationality = excluded.nationality,
@@ -791,12 +1188,15 @@ def upsert_candidate_profile(tg_id: int, fields: dict):
                years_experience = excluded.years_experience,
                availability = excluded.availability,
                documents = excluded.documents,
+               resume_filename = COALESCE(excluded.resume_filename, candidates.resume_filename),
+               resume_data = COALESCE(excluded.resume_data, candidates.resume_data),
                updated_at = excluded.updated_at""",
         (
             tg_id, fields.get("full_name"), fields.get("nationality"),
             fields.get("current_rank"), fields.get("vessel_types"),
             fields.get("years_experience"), fields.get("availability"),
-            fields.get("documents"), datetime.now().isoformat(),
+            fields.get("documents"), fields.get("resume_filename"), fields.get("resume_data"),
+            datetime.now().isoformat(),
         ),
     )
     conn.commit()
@@ -834,3 +1234,85 @@ def list_contacts_since(days: int = 7):
     ).fetchall()
     conn.close()
     return [r["contact"] for r in rows]
+
+
+# ---------------------------------------------------------------- LinkedIn
+def linkedin_is_seen(post_id: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM linkedin_seen WHERE post_id = ?", (post_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def linkedin_mark_seen(post_id: str, verdict: str = ""):
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO linkedin_seen (post_id, seen_at, verdict) VALUES (?, ?, ?)",
+                 (post_id, datetime.now().isoformat(), verdict))
+    conn.commit()
+    conn.close()
+
+
+def set_vacancy_source(vacancy_id: int, source: str, source_url: str):
+    conn = get_conn()
+    conn.execute("UPDATE vacancies SET source = ?, source_url = ? WHERE id = ?", (source, source_url, vacancy_id))
+    conn.commit()
+    conn.close()
+
+
+def linkedin_stats() -> dict:
+    """Сводка по вакансиям из LinkedIn: всего, 24ч, 7 дней, по статусам и по флотам."""
+    conn = get_conn()
+    now = datetime.now()
+    d1 = (now - timedelta(days=1)).isoformat()
+    d7 = (now - timedelta(days=7)).isoformat()
+
+    def one(sql, *args):
+        return conn.execute(sql, args).fetchone()[0]
+
+    base = "FROM vacancies WHERE source = 'linkedin'"
+    out = {
+        "total": one(f"SELECT COUNT(*) {base} AND status != 'deleted'"),
+        "day": one(f"SELECT COUNT(*) {base} AND status != 'deleted' AND created_at > ?", d1),
+        "week": one(f"SELECT COUNT(*) {base} AND status != 'deleted' AND created_at > ?", d7),
+        "published": one(f"SELECT COUNT(*) {base} AND status = 'published'"),
+        "draft": one(f"SELECT COUNT(*) {base} AND status IN ('draft','queued','scheduled')"),
+        "deleted": one(f"SELECT COUNT(*) {base} AND status = 'deleted'"),
+        "applied": one(
+            "SELECT COUNT(DISTINCT a.candidate_tg_id) FROM applications a JOIN vacancies v ON v.id = a.vacancy_id "
+            "WHERE v.source = 'linkedin'"),
+        "seen": one("SELECT COUNT(*) FROM linkedin_seen"),
+    }
+    fleets = {}
+    for fleet, n in conn.execute(
+            f"SELECT COALESCE(fleet_tag,'?'), COUNT(*) {base} AND status = 'published' GROUP BY 1").fetchall():
+        fleets[fleet] = n
+    out["fleets"] = fleets
+    conn.close()
+    return out
+
+
+def linkedin_list(offset: int = 0, limit: int = 8):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, position, vessel, fleet_tag, position_tag, contact, status, created_at, source_url
+           FROM vacancies WHERE source = 'linkedin' AND status != 'deleted'
+           ORDER BY id DESC LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM vacancies WHERE source = 'linkedin' AND status != 'deleted'").fetchone()[0]
+    conn.close()
+    return rows, total
+
+
+def linkedin_delete(vacancy_id: int):
+    """Помечает вакансию LinkedIn удалённой; возвращает (channel_message_id, fleet_tag) для чистки канала."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT channel_message_id, fleet_tag, status FROM vacancies WHERE id = ? AND source = 'linkedin'",
+        (vacancy_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    conn.execute("UPDATE vacancies SET status = 'deleted' WHERE id = ?", (vacancy_id,))
+    conn.commit()
+    conn.close()
+    return dict(row)
