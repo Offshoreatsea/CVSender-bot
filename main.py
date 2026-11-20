@@ -1,31 +1,24 @@
 import asyncio
-import html
 import io
-import sqlite3
 import json
 import os
-import random
 import re
 import time
 from datetime import datetime, timedelta
 
 import anthropic
-import httpx
-import stripe
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
-    LinkPreviewOptions,
     MenuButtonWebApp,
     Message,
     PreCheckoutQuery,
@@ -34,8 +27,6 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
-import email_apply
-import ranks
 import webapp
 
 load_dotenv()
@@ -43,169 +34,60 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "cvsenderseaman")
-# Баннер, который прикрепляется отдельным фото-сообщением перед текстом каждой
-# опубликованной в канал вакансии (путь относительно корня проекта)
-CHANNEL_BANNER_PATH = os.path.join(os.path.dirname(__file__), "static", "assets", "channel_banner.jpg")
-# Отключаем автопревью для ссылки на канал в конце каждого поста — иначе
-# Telegram подтягивает описание канала и кнопку "ПЕРЕЙТИ В КАНАЛ" отдельным
-# большим блоком под текстом; нужна просто голая строка со ссылкой, как у
-# OffshoreAtSea.
-NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "cvsenderforsea")
 CHANNEL_ID = f"@{CHANNEL_USERNAME}"
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}")
-# Отдельный канал для танкеров и газовозов (LNG/LPG) — публикуется ТУДА
-# ВМЕСТО основного канала, не вместе с ним: вакансия либо танкерная/газовая,
-# либо нет, флот у вакансии всегда ровно один (fleet_tag == "Tanker" уже
-# включает LNG/LPG — см. TANKER_VESSEL_TAGS).
-TANKER_CHANNEL_USERNAME = os.getenv("TANKER_CHANNEL_USERNAME", "tankerjobatsea")
-TANKER_CHANNEL_ID = f"@{TANKER_CHANNEL_USERNAME}"
-TANKER_CHANNEL_LINK = os.getenv("TANKER_CHANNEL_LINK", f"https://t.me/{TANKER_CHANNEL_USERNAME}")
-# Ссылка в хвосте каждой вакансии (вместо ссылки на группу) и URL кнопки "Get More Offers"
-POST_FOOTER_LINK = os.getenv("POST_FOOTER_LINK", "https://t.me/EasyWayAtSea_bot")
-GET_MORE_OFFERS_URL = os.getenv("GET_MORE_OFFERS_URL", "https://www.wayatsea.com")
 APPLY_BOT_LINK = os.getenv("APPLY_BOT_LINK", f"https://t.me/{CHANNEL_USERNAME}")
 CONSULT_LINK = os.getenv("CONSULT_LINK", "https://t.me/cvsenderforsea")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL")  # публичный https-адрес мини-приложения, см. README
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK")  # готовая ссылка из Stripe Dashboard, напр. https://buy.stripe.com/...
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
 STRIPE_DIGEST_PAYMENT_LINK = os.getenv("STRIPE_DIGEST_PAYMENT_LINK")  # отдельная ссылка на разовую покупку email-дайджеста ($5)
 PORT = int(os.getenv("PORT", "8080"))
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "800"))
 SUBSCRIPTION_DAYS = 30
-# Сколько дней вакансий отдаём новому подписчику при первом выборе должности —
-# не всю историю канала, а недавнее окно, чтобы не сливать сразу всю базу
-# бесплатно при первой же подписке
-BACKFILL_DAYS = 5
+MAX_POSITIONS = 2
 REFERRAL_BONUS_DAYS = 3
 TRIAL_DAYS = 3
 EMAIL_DIGEST_PRICE_STARS = int(os.getenv("EMAIL_DIGEST_PRICE_STARS", "165"))  # ориентир: ~$5
 
 DIGEST_TIMES = ["09:00", "14:00", "19:00"]
 
-# Фиксированный список должностей — общий для всех трёх флотов (Merchant,
-# Tanker, Offshore частично пересекаются по названиям — например "Master"
-# существует во всех трёх, но это РАЗНЫЕ подписки, различаются полем
-# fleet_tag, а не суффиксом в самом теге). Источник правды для тегов
-# #Position и для матчинга в /subscribe.
+# Фиксированный список должностей — единственный источник правды для тегов
+# #Position и для матчинга в /subscribe. Если встретится реально новая
+# должность, которой тут нет, — просто допишите строку в список, ничего
+# больше менять не нужно.
 RANK_TAGS = [
-    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer", "MasterSDPO",
-    "DeckCadet", "SafetyOfficer", "HLO",
-    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer", "EngineCadet",
-    "ETO", "Electrician", "ElectricianAssistant", "RefEngineer", "GasEngineer",
-    "Bosun", "AB", "OS", "Roustabout", "Motorman", "Oiler", "Wiper", "Fitter", "Welder",
-    "CraneOperator", "GangwayOperator", "Rigger",
-    "Cook", "NightCook", "Steward", "Campboss", "ChiefSteward", "Messman", "Baker",
+    "Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet",
+    "ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer", "EngineCadet",
+    "ETO", "Electrician", "Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter",
+    "Cook", "Steward", "Campboss", "ChiefSteward",
+    "CraneOperator", "DPOperator", "ROVPilot", "Rigger", "Welder", "Scaffolder",
+    "ClientRepresentative", "SafetyOfficer", "Surveyor",
 ]
 
-# Департаменты для Merchant и Tanker — идентичная структура у обоих флотов
-# (одни и те же названия должностей, отличие только в поле fleet_tag)
-MERCHANT_TANKER_DEPARTMENTS = {
-    "Bridge Officers": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "JuniorOfficer"],
-    "Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
-                        "RefEngineer", "ETO", "Electrician", "GasEngineer"],
-    "Deck Ratings": ["Bosun", "AB", "OS", "Fitter", "Welder", "DeckCadet"],
-    "Engine Ratings": ["Oiler", "Wiper", "Motorman", "Fitter", "Welder", "EngineCadet"],
-    "Catering": ["Cook", "NightCook", "Steward", "Messman", "Baker"],
+# Группировка тегов по департаментам — чисто вопрос навигации в /subscribe,
+# на матчинг вакансий и хранение подписок не влияет (там как был, так и
+# остался плоский position_tag). Допишите сюда любую новую должность из
+# RANK_TAGS в подходящий департамент, иначе она не попадёт ни в один экран.
+DEPARTMENTS = {
+    "Bridge": ["Master", "ChiefOfficer", "SecondOfficer", "ThirdOfficer", "DeckCadet"],
+    "Engine": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "FourthEngineer",
+               "EngineCadet", "ETO", "Electrician"],
+    "Ratings": ["Bosun", "AB", "OS", "Motorman", "Oiler", "Fitter"],
+    "Catering": ["Cook", "Steward", "Campboss", "ChiefSteward"],
+    "Offshore & Specialist": ["CraneOperator", "DPOperator", "ROVPilot", "Rigger",
+                              "Welder", "Scaffolder", "ClientRepresentative",
+                              "SafetyOfficer", "Surveyor"],
 }
 
-OFFSHORE_DEPARTMENTS = {
-    # Master — единственное исключение с отдельным DP-тегом (MasterSDPO).
-    # Chief/Second/Third Officer с пометкой SDPO/DPO/JDPO схлопываются в
-    # базовый тег (ChiefOfficer/SecondOfficer/ThirdOfficer) — отдельного
-    # DP-варианта для них НЕТ, см. правило в промпте ниже
-    "Bridge Officers": ["MasterSDPO", "Master", "ChiefOfficer",
-                        "SecondOfficer", "ThirdOfficer", "SafetyOfficer", "HLO"],
-    "Engine Officers": ["ChiefEngineer", "SecondEngineer", "ThirdEngineer", "JuniorEngineer",
-                        "ETO", "Electrician", "ElectricianAssistant"],
-    "Deck Ratings": ["AB", "OS", "Bosun", "Roustabout", "CraneOperator", "GangwayOperator",
-                     "HLO", "Rigger", "Fitter", "Welder", "DeckCadet"],
-    "Engine Ratings": ["Motorman", "Oiler", "Wiper", "Fitter", "Welder", "EngineCadet"],
-    "Catering": ["Cook", "NightCook", "Campboss", "Steward", "ChiefSteward", "Messman"],
-}
-
-# Три раздела вакансий в /subscribe — флот выбирается первым экраном.
-# Должность выбирается независимо в каждом флоте (одна и та же должность,
-# например Master, может быть выбрана сразу в Merchant И в Tanker — это
-# две разные подписки).
-FLEETS = {
-    "merchant": {"label": "⚓ Торговый флот", "departments": MERCHANT_TANKER_DEPARTMENTS, "hashtag": "MerchantFleet"},
-    "offshore": {"label": "🛠 Офшор", "departments": OFFSHORE_DEPARTMENTS, "hashtag": "OffshoreFleet"},
-    "tanker": {"label": "🛢 Танкера", "departments": MERCHANT_TANKER_DEPARTMENTS, "hashtag": "TankerFleet"},
-}
-
-MAX_POSITIONS_PER_FLEET = 2
-
-# Односторонний альяс матчинга: вакансия с этим тегом ДОПОЛНИТЕЛЬНО уходит
-# подписчикам базового тега (DP-вакансия на Master — это всё ещё вакансия
-# на Master, просто с доп. требованием). Обратного направления нет — тот,
-# кто specifically подписался на MasterSDPO, не должен получать вообще
-# любые Master-вакансии, только DP. Только офшор — у Chief/Second/Third
-# Officer отдельного DP-тега больше нет вообще (см. промпт), обе роли уже
-# схлопнуты в один тег на этапе разбора текста.
-TAG_MATCH_ALIASES = {
-    "MasterSDPO": ["Master"],
-}
-
-# Типы судов → флот. Флот вакансии определяется программно по этому словарю
-# (а не тем, что попросили угадать у Claude) — так надёжнее: одна ошибка в
-# классификации судна не разваливает всю логику подписок. Claude выбирает
-# только vessel_tag из списка ниже, а флот вычисляется автоматически.
-MERCHANT_VESSEL_TAGS = [
-    "BulkCarrier", "CapesizeBulkCarrier", "NewcastlemaxBulkCarrier", "PostPanamaxBulkCarrier",
-    "PanamaxBulkCarrier", "KamsarmaxBulkCarrier", "UltramaxBulkCarrier", "SupramaxBulkCarrier",
-    "HandymaxBulkCarrier", "HandysizeBulkCarrier", "MiniBulkCarrier", "OreCarrier", "CoalCarrier",
-    "GrainCarrier", "CementCarrier", "WoodchipCarrier", "GeneralCargoVessel", "MultipurposeVessel",
-    "HeavyLiftVessel", "ContainerShip", "FeederContainerVessel", "CoasterVessel", "RoRoVessel",
-    "RoPax", "PureCarAndTruckCarrier", "PureCarCarrier", "CarCarrier", "LivestockCarrier",
-    "ReeferVessel", "TimberCarrier", "BargeCarrier", "DeckCargoVessel", "HeavyTransportVessel",
-    "PassengerVessel",  # "Passenger ship", "Cruise ship" без доп. уточнений — Merchant, не Offshore/Tanker
+# Фиксированный список типов судов — тоже единый источник правды для тегов
+# и матчинга.
+VESSEL_TAGS = [
+    "Tanker", "Container", "Bulk", "LNG", "LPG", "Chemical",
+    "Offshore", "OSV", "CSV", "DSV", "MPV", "MPSV", "AHTS", "PSV", "SOV",
+    "CableLayer", "Dredger", "Cruise", "RoRo", "Ferry", "Yacht", "FPSO", "JackUp",
 ]
-TANKER_VESSEL_TAGS = [
-    "Tanker",  # обобщённый тег — когда в вакансии перечислено сразу НЕСКОЛЬКО
-               # подтипов танкеров одной фразой ("Oil, Chemical & VLCC Vessels",
-               # "our tanker fleet") и это описание диапазона судов компании,
-               # а не одного конкретного судна — см. правило в промпте ниже
-    "ULCC", "SuezmaxTanker", "AframaxTanker", "PanamaxTanker", "HandysizeTanker", "SmallTanker",
-    "CPPTanker", "DPPTanker", "LNGCarrier", "LPGCarrier", "LEGCarrier", "AmmoniaCarrier",
-    "CO2Carrier", "ChemicalOilTanker", "JuiceCarrier", "OilTanker", "ChemicalTanker", "VLCC",
-    "VLGC", "ProductTanker", "CrudeOilTanker", "BitumenTanker", "AsphaltTanker", "EthyleneCarrier",
-    "MethanolTanker", "ShuttleTanker", "BunkeringTanker", "OilChemicalTanker",
-    "LNGBunkerVessel", "LPGBunkerVessel",
-]
-OFFSHORE_VESSEL_TAGS = [
-    "Tug", "ASDTug", "UtilityVessel", "CrewBoat", "Workboat", "Multicat", "Dredger", "DSV", "ROV",
-    "SurveyVessel", "PSV", "MPSV", "OCV", "ERRV", "AHT", "AHTS", "GeophysicalVessel",
-    "SeismicVessel", "WTIV", "WFSV", "SOV", "CSOV", "CLV", "CRV", "RockDumpingVessel", "CSV",
-    "SSCV", "DrillingVessel", "JackUp", "FallpipeVessel", "TrenchingVessel", "PLSV", "HLV",
-    "CraneVessel", "ConstructionVessel", "AccommodationVessel", "Flotel", "StandbyVessel",
-    "OSRV", "FFV", "WSV", "WIV", "WellTestingVessel",
-    "FPSO", "FSO", "FPU", "FLNG", "FSRU",  # плавучие добычные платформы — в офшоре, не в танкерах
-    "OffshoreSupportVessel",  # обобщённый тег — "Offshore Support Vessel", "Offshore Installation
-    # Vessel", судно с упоминанием DP/ДП без уточнения конкретного типа, голое упоминание ROV —
-    # всё это явно офшор, но не подходит ни под один конкретный тег выше
-]
-
-VESSEL_TAGS = MERCHANT_VESSEL_TAGS + TANKER_VESSEL_TAGS + OFFSHORE_VESSEL_TAGS
-
-VESSEL_TAG_TO_FLEET = {}
-for _tag in MERCHANT_VESSEL_TAGS:
-    VESSEL_TAG_TO_FLEET[_tag] = "Merchant"
-for _tag in TANKER_VESSEL_TAGS:
-    VESSEL_TAG_TO_FLEET[_tag] = "Tanker"
-for _tag in OFFSHORE_VESSEL_TAGS:
-    VESSEL_TAG_TO_FLEET[_tag] = "Offshore"
-
-
-def vessel_tag_to_fleet(vessel_tag: str | None) -> str:
-    """Флот вакансии — вычисляется из vessel_tag программно, не спрашивается
-    у Claude напрямую (надёжнее). Если тип судна не распознан или не указан —
-    по умолчанию Merchant (самый частый и самый безопасный дефолт)."""
-    return VESSEL_TAG_TO_FLEET.get(vessel_tag, "Merchant")
-
 
 FALLBACK_TAG = "Other"
 
@@ -219,60 +101,38 @@ TR = {
                   "⚠️ CV Sender is a vacancy aggregator only — we are not "
                   "the employer and are not responsible for working conditions "
                   "at the companies listed.",
-        "choose_fleet": "Choose a fleet — up to 2 positions per fleet:",
         "choose_department": "Choose a department to see its positions:",
         "choose_position": "Choose one or more positions — tap to select, tap "
                             "again to remove. I'll send matching vacancies from "
                             "the last 7 days for each, then new ones as they're posted:",
         "subscribed": "✅ Added {tag}. Sending recent vacancies...",
         "unsubscribed": "Removed {tag} from your alerts.",
-        "already_locked_tag": "This position is already locked in for this period. To change it, contact the admin.",
         "backfill_empty": "No {tag} vacancies in the last 7 days yet — "
                            "you'll get the next one as soon as it's posted.",
         "done": "✅ Done",
         "back_to_departments": "⬅ Departments",
-        "back_to_fleets": "⬅ Fleets",
         "no_selection": "You haven't picked any position yet — tap one above.",
         "subscribed_summary": "Your alerts are set up for: {tags}",
         "contact_admin": "🆘 Contact admin",
-        "pay_intro": "Your free trial has ended. Subscribe by card for instant "
-                     "notifications for the positions you choose.",
+        "pay_intro": "Your free trial has ended. {price} Stars gets you 30 more days "
+                     "of instant notifications for the positions you choose.",
         "pay_button": "⭐ Pay {price} Stars for 30 days",
-        "pay_button_card": "💳 Subscribe by card",
-        "contact_locked": "📩 Contact: 🔒 available on a paid subscription — /subscribe to unlock",
-        "pay_contact_admin": "💬 Message admin",
-        "bot_intro": (
-            "🚢 <b>This bot sends you matched job vacancies straight to your chat</b> — "
-            "no need to scroll the channel.\n\n"
-            "What it can do:\n"
-            "• Pick up to 2 positions in each fleet (Merchant / Offshore / Tanker) — "
-            "get notified the moment a matching vacancy is posted\n"
-            "• Search all vacancies with filters right inside the bot (/search)\n"
-            "• Apply to a vacancy in one click, no need to write an email yourself\n"
-            "• Get a weekly list of recruiter emails from posted vacancies (/getemails)\n"
-            "• Change your language anytime\n\n"
-            "Let\'s set up your alerts:"
-        ),
+        "pay_button_card": "💳 Pay by card",
+        "pay_contact_admin": "💬 Can't pay with Stars? Message admin",
         "trial_started": "🎉 You get {days} days free — no card needed. Choose your positions:",
         "referral_bonus": "🎁 A friend you invited just paid — you got +{days} days, now active until {until}!",
         "invite_friend": "🎁 Invite a friend, get 3 free days",
         "referral_share_text": "Get job alerts by position on CV Sender 👇",
-        "expiry_reminder": "⏳ Your subscription ends in a few days — please renew to keep your job alerts active. If you want to cancel, message the admin:",
+        "expiry_reminder": "⏳ Your job alerts subscription ends in less than 24 hours. Renew to keep getting instant notifications:",
         "revoked_notice": "Your job alerts subscription has been cancelled by the admin.",
-        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — one-time purchase.",
+        "digest_intro": "📧 Get every contact email from vacancies posted in the channel over the last 7 days — {price} Stars, one-time purchase.",
         "digest_pay_button": "⭐ Pay {price} Stars",
-        "digest_menu_button": "📧 Get weekly email list",
+        "digest_menu_button": "📧 Get weekly email digest",
         "digest_delivered": "✅ Here are {count} emails from the last 7 days:",
         "digest_empty": "No vacancies with contact emails were posted in the last 7 days.",
-        "digest_count_button": "🔢 How many emails available now?",
-        "digest_count_result": "📧 {count} emails available for the last 7 days.",
-        "digest_demo_button": "🎁 Free demo — 5 random emails",
-        "digest_demo_result": "Here are 5 random emails out of {count} available (last 7 days):\n\n{sample}\n\nWant all {count}? Get the full list above.",
-        "digest_demo_left": "Free demo uses left: {left}.",
-        "digest_demo_limit_reached": "You've used both free demo tries. Get the full list above to see all emails.",
         "pay_active_until": "✅ Your subscription is active until {until}.",
         "payment_thanks": "✅ Payment received — active until {until}. Now pick your positions:",
-        "max_positions": "You can pick up to {max} positions per fleet.",
+        "max_positions": "You can pick up to {max} positions. Remove one first to add another.",
         "positions_locked_notice": "Your positions are locked in for this period: {tags}. "
                                     "Contact admin if you need to change them.",
         "send_cv": "Send your CV to: {v}",
@@ -287,60 +147,38 @@ TR = {
                  "⚠️ CV Sender — только агрегатор вакансий, мы не являемся "
                  "работодателем и не несём ответственности за условия труда "
                  "у указанных компаний.",
-        "choose_fleet": "Выберите флот — до 2 должностей в каждом:",
         "choose_department": "Выберите департамент, чтобы увидеть должности:",
         "choose_position": "Выберите одну или несколько должностей — нажмите, "
                             "чтобы добавить, ещё раз — чтобы убрать. Пришлю вакансии "
                             "за последние 7 дней по каждой, и дальше — все новые:",
         "subscribed": "✅ Добавлено: {tag}. Отправляю вакансии...",
         "unsubscribed": "Убрано из подписки: {tag}.",
-        "already_locked_tag": "Эта должность уже зафиксирована на этот период. Чтобы поменять — напишите админу.",
         "backfill_empty": "Вакансий по {tag} за последние 7 дней пока нет — "
                            "пришлю, как только появится подходящая.",
         "done": "✅ Готово",
         "back_to_departments": "⬅ Департаменты",
-        "back_to_fleets": "⬅ Флоты",
         "no_selection": "Вы ещё не выбрали ни одной должности — нажмите на любую выше.",
         "subscribed_summary": "Ваши подписки: {tags}",
         "contact_admin": "🆘 Написать администратору",
-        "pay_intro": "Ваш бесплатный период закончился. Оформите подписку картой, "
-                     "чтобы получать мгновенные уведомления по выбранным должностям.",
+        "pay_intro": "Ваш бесплатный период закончился. {price} ⭐ дают ещё 30 дней "
+                     "мгновенных уведомлений по выбранным должностям.",
         "pay_button": "⭐ Оплатить {price} Stars за 30 дней",
-        "pay_button_card": "💳 Оформить подписку картой",
-        "contact_locked": "📩 Контакт: 🔒 доступен на платной подписке — оформите в /subscribe",
-        "pay_contact_admin": "💬 Написать администратору",
-        "bot_intro": (
-            "🚢 <b>Этот бот присылает подходящие вакансии прямо в чат</b> — "
-            "не нужно листать канал.\n\n"
-            "Что умеет:\n"
-            "• Выбрать до 2 должностей в каждом флоте (Торговый / Офшор / Танкера) — "
-            "уведомление придёт, как только появится подходящая вакансия\n"
-            "• Поиск по всем вакансиям с фильтрами прямо в боте (/search)\n"
-            "• Отклик на вакансию в один клик, без необходимости писать email самому\n"
-            "• Еженедельная подборка email рекрутёров из опубликованных вакансий (/getemails)\n"
-            "• Сменить язык в любой момент\n\n"
-            "Настроим ваши уведомления:"
-        ),
+        "pay_button_card": "💳 Оплатить картой",
+        "pay_contact_admin": "💬 Не можете оплатить Stars? Написать администратору",
         "trial_started": "🎉 Вам доступны {days} дня бесплатно — без карты. Выберите должности:",
         "referral_bonus": "🎁 Приглашённый вами друг оплатил — вам +{days} дня, теперь активно до {until}!",
         "invite_friend": "🎁 Пригласить друга, получить 3 дня бесплатно",
         "referral_share_text": "Уведомления о вакансиях по должности в CV Sender 👇",
-        "expiry_reminder": "⏳ Через несколько дней у вас закончится подписка. Пожалуйста, продлите её. Если хотите отменить подписку — напишите админу:",
+        "expiry_reminder": "⏳ Ваша подписка на уведомления заканчивается меньше чем через 24 часа. Продлите, чтобы не пропускать вакансии:",
         "revoked_notice": "Ваша подписка на уведомления отменена администратором.",
-        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — разовая покупка.",
+        "digest_intro": "📧 Получите все email из вакансий, опубликованных в канале за последние 7 дней — {price} Stars, разовая покупка.",
         "digest_pay_button": "⭐ Оплатить {price} Stars",
-        "digest_menu_button": "📧 Получить подборку email за неделю",
+        "digest_menu_button": "📧 Получить email-дайджест за неделю",
         "digest_delivered": "✅ Вот {count} email за последние 7 дней:",
         "digest_empty": "За последние 7 дней не было вакансий с контактным email.",
-        "digest_count_button": "🔢 Сколько email доступно сейчас?",
-        "digest_count_result": "📧 Доступно {count} email за последние 7 дней.",
-        "digest_demo_button": "🎁 Бесплатное демо — 5 случайных email",
-        "digest_demo_result": "Вот 5 случайных email из {count} доступных (за последние 7 дней):\n\n{sample}\n\nХотите все {count}? Оформите полный список выше.",
-        "digest_demo_left": "Осталось бесплатных попыток демо: {left}.",
-        "digest_demo_limit_reached": "Вы уже использовали обе бесплатные попытки демо. Оформите полный список выше, чтобы увидеть все email.",
         "pay_active_until": "✅ Подписка активна до {until}.",
         "payment_thanks": "✅ Оплата прошла — активно до {until}. Теперь выберите должности:",
-        "max_positions": "Можно выбрать не больше {max} должностей в одном флоте.",
+        "max_positions": "Можно выбрать не больше {max} должностей. Сначала уберите одну, чтобы добавить другую.",
         "positions_locked_notice": "Ваши должности зафиксированы на этот период: {tags}. "
                                     "Если нужно изменить — напишите администратору.",
         "send_cv": "Отправьте резюме на: {v}",
@@ -355,60 +193,38 @@ TR = {
                  "⚠️ CV Sender — лише агрегатор вакансій, ми не є "
                  "роботодавцем і не несемо відповідальності за умови праці "
                  "у зазначених компаніях.",
-        "choose_fleet": "Оберіть флот — до 2 посад у кожному:",
         "choose_department": "Оберіть департамент, щоб побачити посади:",
         "choose_position": "Оберіть одну або кілька посад — натисніть, щоб додати, "
                             "ще раз — щоб прибрати. Надішлю вакансії за останні 7 днів "
                             "по кожній, а далі — всі нові:",
         "subscribed": "✅ Додано: {tag}. Надсилаю вакансії...",
         "unsubscribed": "Прибрано з підписки: {tag}.",
-        "already_locked_tag": "Ця посада вже зафіксована на цей період. Щоб змінити — напишіть адміну.",
         "backfill_empty": "Вакансій по {tag} за останні 7 днів поки немає — "
                            "надішлю, щойно з'явиться відповідна.",
         "done": "✅ Готово",
         "back_to_departments": "⬅ Департаменти",
-        "back_to_fleets": "⬅ Флоти",
         "no_selection": "Ви ще не обрали жодної посади — натисніть на будь-яку вище.",
         "subscribed_summary": "Ваші підписки: {tags}",
         "contact_admin": "🆘 Написати адміністратору",
-        "pay_intro": "Ваш безкоштовний період закінчився. Оформіть підписку карткою, "
-                     "щоб отримувати миттєві сповіщення за обраними посадами.",
+        "pay_intro": "Ваш безкоштовний період закінчився. {price} ⭐ дають ще 30 днів "
+                     "миттєвих сповіщень за обраними посадами.",
         "pay_button": "⭐ Оплатити {price} Stars за 30 днів",
-        "pay_button_card": "💳 Оформити підписку карткою",
-        "contact_locked": "📩 Контакт: 🔒 доступний на платній підписці — оформіть у /subscribe",
-        "pay_contact_admin": "💬 Напишіть адміністратору",
-        "bot_intro": (
-            "🚢 <b>Цей бот надсилає підходящі вакансії прямо в чат</b> — "
-            "не потрібно гортати канал.\n\n"
-            "Що вміє:\n"
-            "• Обрати до 2 посад у кожному флоті (Торговий / Офшор / Танкера) — "
-            "сповіщення прийде, щойно з\'явиться підходяща вакансія\n"
-            "• Пошук по всіх вакансіях з фільтрами прямо в боті (/search)\n"
-            "• Відгук на вакансію в один клік, без потреби писати email самому\n"
-            "• Щотижнева добірка email рекрутерів з опублікованих вакансій (/getemails)\n"
-            "• Змінити мову в будь-який момент\n\n"
-            "Налаштуємо ваші сповіщення:"
-        ),
+        "pay_button_card": "💳 Оплатити карткою",
+        "pay_contact_admin": "💬 Не можете оплатити Stars? Напишіть адміністратору",
         "trial_started": "🎉 Вам доступні {days} дні безкоштовно — без картки. Оберіть посади:",
         "referral_bonus": "🎁 Запрошений вами друг оплатив — вам +{days} дні, тепер активно до {until}!",
         "invite_friend": "🎁 Запросити друга, отримати 3 дні безкоштовно",
         "referral_share_text": "Сповіщення про вакансії за посадою в CV Sender 👇",
-        "expiry_reminder": "⏳ Через кілька днів у вас закінчиться підписка. Будь ласка, продовжте її. Якщо хочете скасувати підписку — напишіть адміну:",
+        "expiry_reminder": "⏳ Ваша підписка на сповіщення закінчується менш ніж за 24 години. Продовжте, щоб не пропускати вакансії:",
         "revoked_notice": "Вашу підписку на сповіщення скасовано адміністратором.",
-        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — разова покупка.",
+        "digest_intro": "📧 Отримайте всі email з вакансій, опублікованих у каналі за останні 7 днів — {price} Stars, разова покупка.",
         "digest_pay_button": "⭐ Оплатити {price} Stars",
-        "digest_menu_button": "📧 Отримати добірку email за тиждень",
+        "digest_menu_button": "📧 Отримати email-дайджест за тиждень",
         "digest_delivered": "✅ Ось {count} email за останні 7 днів:",
         "digest_empty": "За останні 7 днів не було вакансій із контактним email.",
-        "digest_count_button": "🔢 Скільки email доступно зараз?",
-        "digest_count_result": "📧 Доступно {count} email за останні 7 днів.",
-        "digest_demo_button": "🎁 Безкоштовне демо — 5 випадкових email",
-        "digest_demo_result": "Ось 5 випадкових email із {count} доступних (за останні 7 днів):\n\n{sample}\n\nХочете всі {count}? Оформіть повний список вище.",
-        "digest_demo_left": "Залишилось безкоштовних спроб демо: {left}.",
-        "digest_demo_limit_reached": "Ви вже використали обидві безкоштовні спроби демо. Оформіть повний список вище, щоб побачити всі email.",
         "pay_active_until": "✅ Підписку активовано до {until}.",
         "payment_thanks": "✅ Оплату отримано — активно до {until}. Тепер оберіть посади:",
-        "max_positions": "Можна обрати не більше {max} посад в одному флоті.",
+        "max_positions": "Можна обрати не більше {max} посад. Спочатку приберіть одну, щоб додати іншу.",
         "positions_locked_notice": "Ваші посади зафіксовано на цей період: {tags}. "
                                     "Якщо потрібно змінити — напишіть адміністратору.",
         "send_cv": "Надішліть резюме на: {v}",
@@ -497,99 +313,46 @@ distinct vacancy starts and ends by meaning (a new job title / new "send your CV
 usually signals a new posting), then extract fields for each one separately.
 
 For each vacancy, extract:
-- position: short job title, human-readable, ALWAYS with normal spacing between words
-  regardless of how it was abbreviated in the source — e.g. source "2/O" or "2nd Off" or
-  "Captain" must still produce position "Second Officer" / "Master". Never output the
-  position field in CamelCase or without spaces — that format is ONLY for position_tag.
-- position_tag: map the position to EXACTLY ONE tag from this fixed list (no spaces,
-  CamelCase). The SAME tag (e.g. Master, ChiefOfficer, Bosun) is used regardless of which
-  fleet the vessel belongs to — fleet is tracked separately via vessel_tag, not baked into
-  this tag. So just pick the closest rank match, ignoring fleet entirely at this step:
+- position: short job title, as written/implied in the source (human-readable, keep natural
+  wording, e.g. "Chief Engineer", "2nd Officer")
+- position_tag: map the position to EXACTLY ONE tag from this fixed list (pick the closest
+  match — treat abbreviations, informal titles, and near-synonyms as the same rank):
   {rank_tags}
-  Common rank-to-tag mappings (apply the same logic to anything similar not listed here):
+  Common mappings to use as a guide (not exhaustive — apply the same logic to anything
+  similar that isn't listed here):
     "Master", "Captain", "Skipper" -> Master
-    "C/O", "Ch.Off", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer
-    "2/O", "2nd Off", "2nd Officer", "Second Officer", "Second Mate" -> SecondOfficer
-    "3/O", "3rd Off", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
+    "C/O", "Chief Officer", "Chief Mate", "First Mate", "1/O" -> ChiefOfficer
+    "2/O", "2nd Officer", "Second Officer", "Second Mate", "SDPO" -> SecondOfficer
+    "3/O", "3rd Officer", "Third Officer", "Third Mate" -> ThirdOfficer
     "Deck Cadet", "Deck Trainee", "Navigation Cadet" -> DeckCadet
     "C/E", "Chief Engineer" -> ChiefEngineer
-    "2/E", "2nd Eng", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
-    "3/E", "3rd Eng", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer
-    "4/E", "Junior Engineer", "Third Assistant Engineer" -> JuniorEngineer
+    "2/E", "Second Engineer", "First Assistant Engineer" -> SecondEngineer
+    "3/E", "Third Engineer", "Second Assistant Engineer" -> ThirdEngineer
+    "4/E", "Fourth Engineer", "Third Assistant Engineer" -> FourthEngineer
     "Engine Cadet", "Engine Trainee", "Motor Cadet" -> EngineCadet
-    "Junior ETO", "Electro-Technical Officer", "Electrical Officer" -> ETO
+    "Junior ETO", "Electro-Technical Officer", "Electrical Officer", "Electrical"
+    (as a job title, not a requirement) -> ETO
     "Ship's Electrician", "Electrical Rating" -> Electrician
-    "Electrician Assistant", "Junior Electrician" -> ElectricianAssistant (offshore only)
     "Boatswain", "Bosun's Mate" -> Bosun
     "AB", "Able Seaman", "Able Bodied Seaman", "Deck Hand", "Deckhand" -> AB
     "OS", "Ordinary Seaman" -> OS
-    "Motorman", "Engine Rating", "Pumpman" (tanker/offshore cargo pump rating — no
-    separate tag exists for it), "Plumber" -> Motorman
-    "Oiler" -> Oiler; "Wiper" -> Wiper — these are DIFFERENT ratings, don't merge them
-    "Fitter", "Engine Fitter" -> Fitter; "Welder" -> Welder
-    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook; "Night Cook" -> NightCook
-    "Steward", "Stewardess" -> Steward; "Mess Man", "Messman" -> Messman — DIFFERENT
-    roles, don't merge them; "Baker" -> Baker
-    "Deck Mechanic", "Deck Engineer" (hybrid deck/engine rating common on OSVs) ->
-    ThirdEngineer if senior/experienced, or JuniorEngineer if junior/entry-level; do NOT
-    use "Other" for these
-    "Ref Engineer", "Reefer Engineer" -> RefEngineer; "Gas Engineer" -> GasEngineer
-    (these two exist for merchant/tanker vessels only, not offshore)
-    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number is ambiguous between
-    SecondOfficer and ThirdOfficer — infer from context (years of experience, COC class,
-    senior/junior watch); default to SecondOfficer if truly no way to tell.
-    "EOOW" (Engineer Officer of the Watch) or a bare "Engineer" with no rank number is
-    ambiguous between SecondEngineer and ThirdEngineer — infer from context the same way;
-    default to ThirdEngineer if truly no way to tell.
-  Offshore DP-rank special case (only relevant when vessel_tag indicates an offshore
-  vessel): if the posting mentions SDPO/DPO alongside "Master" -> tag is still MasterSDPO
-  (a distinct tag from plain Master — this is the ONE exception with its own DP tag). But
-  if SDPO/DPO/JDPO is mentioned alongside Chief/Second/Third Officer, DO NOT create a
-  separate DP tag for them — just use the plain ChiefOfficer / SecondOfficer / ThirdOfficer
-  tag (SDPO/DPO implies Chief Officer or Master context; JDPO/DPO implies Second or Third
-  Officer context, used only to help you pick WHICH base rank, not to change the tag itself).
+    "Motorman", "Engine Rating" -> Motorman
+    "Oiler", "Wiper" -> Oiler
+    "Fitter", "Engine Fitter" -> Fitter
+    "Cook", "Ship's Cook", "Chief Cook", "Galley Cook" -> Cook
+    "Steward", "Mess Man", "Messman" -> Steward
+    "Camp Boss", "Campboss", "Catering Manager" -> Campboss
+    "Chief Steward", "Chief Steward/ess" -> ChiefSteward
+    "OOW" (Officer of the Watch) or a bare "Mate" with no rank number given is ambiguous
+    between SecondOfficer and ThirdOfficer — infer from context (years of experience
+    required, COC class, whether it's described as senior/junior watch); if there is truly
+    no way to tell, default to SecondOfficer rather than Other.
   If truly nothing in the list or the guidance above fits, use "Other".
 - vessel: vessel/rig type or name, as written/implied in the source, or null
-- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (the tag itself
-  has no spaces — CamelCase/acronym — but match against it loosely, ignoring case/spacing):
+- vessel_tag: map the vessel type to EXACTLY ONE tag from this fixed list (e.g. "OSV",
+  "Offshore Support Vessel", "supply vessel" -> "OSV"; "product tanker" -> "Tanker"):
   {vessel_tags}
-  Common mappings to use as a guide (apply the same CamelCase-collapsing logic to any
-  similar phrasing not listed here — e.g. "Panamax Bulk Carrier" -> PanamaxBulkCarrier):
-    "crude oil tanker", "crude carrier" -> CrudeOilTanker
-    "chemical tanker", "chem tanker" -> ChemicalTanker
-    "product tanker", "oil products tanker", "CPP tanker" -> CPPTanker; "DPP tanker" -> DPPTanker
-    "VLGC", "very large gas carrier" -> VLGC ; "VLCC", "very large crude carrier" -> VLCC
-    "LNG carrier", "LNG tanker" -> LNGCarrier ; "LPG carrier", "LPG tanker" -> LPGCarrier
-    "general cargo", "general cargo vessel", "multi-purpose cargo", "MPP", "MPV" ->
-    GeneralCargoVessel or MultipurposeVessel (NOT Bulk — bulk carriers are only for actual
-    loose bulk cargo like grain, ore, coal)
-    "tug", "tugboat", "towing vessel" -> Tug; "ASD tug" -> ASDTug (NOT PSV/OSV-type tags —
-    tugs are a distinct vessel type, even though some also do offshore towage work)
-    "pipe lay vessel", "pipelayer", "PLSV" -> PLSV
-    "heavy lift vessel", "heavy-lift carrier", "HLV" -> HLV (offshore) or HeavyLiftVessel
-    (merchant, for a cargo ship that carries heavy-lift cargo rather than installs things)
-    "PSV", "Platform Supply Vessel", "supply vessel" -> PSV; "AHTS", "Anchor Handling Tug
-    Supply" -> AHTS; "MPSV" -> MPSV; "DSV", "Diving Support Vessel" -> DSV
-    "dredger", "dredging vessel", "TSHD", "trailing suction hopper dredger",
-    "cutter suction dredger" -> Dredger
-    "passenger ship", "passenger vessel", "cruise ship" (with no other merchant subtype
-    stated) -> PassengerVessel
-    "Offshore Support Vessel", "OSV" (generic, not a specific PSV/AHTS/MPSV/DSV/CSV type),
-    "Offshore Installation Vessel", "offshore construction support", a bare mention of "ROV"
-    with no more specific vessel name, or a vessel described only by its DP class ("DP2
-    vessel", "DP1", "DP3", "dynamic positioning vessel") with no other vessel type given ->
-    OffshoreSupportVessel. More generally: if the vessel description contains the word
-    "offshore" and nothing more specific above fits, use OffshoreSupportVessel rather than
-    falling through to "Other" (which would wrongly default the vacancy to Merchant fleet).
-  IMPORTANT: if the posting names SEVERAL tanker subtypes together in one phrase to
-  describe the company's range of vessels rather than one specific ship (e.g. "Oil,
-  Chemical & VLCC Vessels", "our tanker fleet", "VLCC/Suezmax/Aframax tankers") — this is
-  still clearly a tanker vacancy, just don't pick arbitrarily between the subtypes: use the
-  generic "Tanker" tag instead. Do NOT let an unclear choice between subtypes push you to
-  "Other" — "Other" should only be used when the vessel isn't a tanker/offshore/merchant
-  type at all, never as a way to avoid picking between valid tanker subtypes.
-  If vessel type isn't stated or nothing in the list fits, use "Other" (this defaults the
-  vacancy to the Merchant fleet — the safest fallback when the vessel type is unclear).
+  If vessel type isn't stated or nothing fits, use "Other".
 - region: country/region/location, or null
 - nationality: nationality/citizenship requirement if stated, or null
 - date: joining/start date, or null
@@ -650,21 +413,6 @@ def slugify_tag(word: str) -> str:
     return "#" + re.sub(r"[^A-Za-z0-9]", "", word)
 
 
-def strip_links(value):
-    """Убирает http(s)- и голые www.-ссылки из строки (Google Drive, сайты
-    компаний и т.п. не публикуем ни в одном поле вакансии, независимо от
-    источника). None/пустая строка проходят как есть."""
-    if not value or not isinstance(value, str):
-        return value
-    value = re.sub(r"https?://\S+", "", value)
-    value = re.sub(r"\bwww\.\S+", "", value)
-    value = re.sub(r"[ \t]+", " ", value)
-    # чистим висящие разделители, которые остаются после вырезания ссылки,
-    # например "email@x.com; " -> "email@x.com"
-    value = re.sub(r"[;,]\s*$", "", value.strip())
-    return value.strip() or None
-
-
 def ai_parse_batch(raw: str) -> list[dict]:
     fallback = [{
         "position": raw.strip().split("\n")[0][:120] or "Vacancy",
@@ -714,43 +462,24 @@ def ai_parse_batch(raw: str) -> list[dict]:
         vessel_tag = item.get("vessel_tag") or FALLBACK_TAG
         if vessel_tag not in VESSEL_TAGS:
             vessel_tag = FALLBACK_TAG
-        # флот — НЕ то, что вернул Claude, а вычисляется программно из
-        # vessel_tag по фиксированному словарю (надёжнее, чем спрашивать
-        # модель угадывать флот напрямую)
-        fleet_tag = vessel_tag_to_fleet(vessel_tag)
         item["position_tag"] = position_tag
         item["vessel_tag"] = vessel_tag
-        item["fleet_tag"] = fleet_tag
-        item["hashtags"] = f"#{position_tag} #{vessel_tag} #{fleet_tag}Fleet"
-        # ссылки (Google Drive, сайты компаний и т.п.) не публикуем ни в одном
-        # текстовом поле — не только при скрейпинге CrewLink, но и в вакансиях,
-        # присланных руками: иногда в "Contact" вместе с email кладут ссылку
-        # на файл или сайт, это тоже нужно вырезать
-        for field_name in ("contact", "notes", "salary", "region", "nationality"):
-            item[field_name] = strip_links(item.get(field_name))
-        item["documents"] = [strip_links(d) for d in (item.get("documents") or [])]
-        item["requirements"] = [strip_links(r) for r in (item.get("requirements") or [])]
+        item["hashtags"] = f"#{position_tag} #{vessel_tag}"
     return data
 
 
-def render_template(fields: dict, hide_contact: bool = False, lang: str | None = None,
-                     show_channel_link: bool = True) -> str:
-    # parse_mode=HTML: любой "<" или "&" в тексте вакансии (например "<2000$"
-    # в зарплате) иначе ломает разбор HTML у Telegram и пост не публикуется —
-    # экранируем всё, что пришло из текста вакансии, а не задано нами самими
+def render_template(fields: dict) -> str:
     def val(key):
         v = fields.get(key)
-        return html.escape(str(v)) if v else None
+        return v if v else None
 
     def as_list(key):
         v = fields.get(key)
         if isinstance(v, list):
-            items = v
-        elif isinstance(v, str) and v.strip():
-            items = [l for l in v.split("\n") if l.strip()]
-        else:
-            items = []
-        return [html.escape(str(i)) for i in items]
+            return v
+        if isinstance(v, str) and v.strip():
+            return [l for l in v.split("\n") if l.strip()]
+        return []
 
     date_val = val("date") or val("dates")
 
@@ -783,26 +512,18 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
 
     if fields.get("notes"):
         parts.append("")
-        parts.append(f"ℹ️ {html.escape(str(fields['notes']))}")
+        parts.append(f"ℹ️ {fields['notes']}")
 
     if val("contact"):
         parts.append("")
-        if hide_contact:
-            # бесплатный триал видит вакансию целиком, кроме самого контакта —
-            # это и есть стимул оформить платную подписку
-            parts.append(t(lang, "contact_locked"))
-        else:
-            parts.append(f"📩 Contact: {val('contact')}")
+        parts.append(f"📩 Contact: {val('contact')}")
 
     if fields.get("hashtags"):
         parts.append("")
         parts.append(fields["hashtags"])
 
-    if show_channel_link:
-        # в канал танкеров этот хвост не добавляем — ссылка вела бы на
-        # ОСНОВНОЙ канал, что бессмысленно внутри другого канала
-        parts.append("")
-        parts.append(f"🔗 {POST_FOOTER_LINK}")
+    parts.append("")
+    parts.append(f"🔗 {CHANNEL_LINK}")
 
     # схлопываем случайные двойные пустые строки (когда почти все поля пустые
     # и подряд идёт несколько условных блоков с "" в начале)
@@ -812,69 +533,6 @@ def render_template(fields: dict, hide_contact: bool = False, lang: str | None =
             continue
         cleaned.append(line)
     return "\n".join(cleaned)
-
-
-CAPTION_LIMIT = 1024  # жёсткий лимит Telegram на подпись к фото
-
-
-def render_caption(fields: dict) -> str:
-    """Версия вакансии для caption к баннеру в канале — всегда укладывается
-    в лимит Telegram (1024 симв.), чтобы фото и текст были ОДНИМ постом, как
-    у OffshoreAtSea. В личные рассылки подписчикам по-прежнему уходит полный
-    текст через render_template — сокращаем только сам пост в канале.
-    Сокращаем по убыванию важности: сначала убираем списки
-    Documents/Requirements целиком, затем ужимаем произвольный текст notes,
-    и только в крайнем случае режем всё жёстко по длине."""
-    text = render_template(fields)
-    if len(text) <= CAPTION_LIMIT:
-        return text
-
-    trimmed = dict(fields)
-    trimmed.pop("documents", None)
-    trimmed.pop("requirements", None)
-    text = render_template(trimmed)
-    if len(text) <= CAPTION_LIMIT:
-        return text
-
-    if trimmed.get("notes"):
-        # считаем, сколько места остаётся под notes, если убрать его целиком,
-        # и обрезаем notes по этому бюджету с многоточием
-        without_notes = dict(trimmed)
-        without_notes.pop("notes", None)
-        base_len = len(render_template(without_notes))
-        budget = CAPTION_LIMIT - base_len - len("ℹ️ ") - 1  # 1 символ на "…"
-        notes = trimmed["notes"]
-        if budget > 20:
-            trimmed["notes"] = notes[:budget].rstrip() + "…"
-        else:
-            trimmed.pop("notes", None)
-        text = render_template(trimmed)
-        if len(text) <= CAPTION_LIMIT:
-            return text
-
-    # крайний случай — жёстко обрезаем, но сохраняем последнюю строку
-    # (ссылку на канал), чтобы пост не обрывался совсем без контекста
-    lines = text.split("\n")
-    footer = lines[-1]
-    head = "\n".join(lines[:-1])
-    budget = CAPTION_LIMIT - len(footer) - 2  # 2 символа на "…\n"
-    return _safe_html_cut(head, budget) + "…\n" + footer
-
-
-def _safe_html_cut(text: str, budget: int) -> str:
-    """Режет text по budget символов, НЕ разрывая HTML-тег (<b>) или entity
-    (&amp;) посередине — иначе Telegram отказывается публиковать пост
-    целиком (именно так ловился баг с обрывом длинных вакансий)."""
-    cut = text[:budget]
-    # разрез внутри незакрытого тега "<...": откатываемся до символа перед "<"
-    last_lt = cut.rfind("<")
-    if last_lt != -1 and cut.find(">", last_lt) == -1:
-        cut = cut[:last_lt]
-    # разрез внутри незакрытой entity "&...;": откатываемся до символа перед "&"
-    last_amp = cut.rfind("&")
-    if last_amp != -1 and cut.find(";", last_amp) == -1:
-        cut = cut[:last_amp]
-    return cut.rstrip()
 
 
 def dedup_key_for(fields: dict) -> str:
@@ -901,59 +559,13 @@ def apply_button_url(vacancy_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=apply_{vacancy_id}"
 
 
-def channel_keyboard(vacancy_id: int, is_tanker: bool = False, include_menu: bool = True) -> InlineKeyboardMarkup:
-    rows = []
-    if not include_menu:
-        # "Get More Offers" — только в самом канале. В личку подписчику (куда
-        # include_menu=True) её не шлём: он туда и так уже попал через бота,
-        # кнопка там не нужна и выглядела как цикл "зайди туда, где уже есть"
-        rows.append([InlineKeyboardButton(
-            text="🎯 Get More Offers", url=GET_MORE_OFFERS_URL
-        )])
-    rows.append([InlineKeyboardButton(text="✉️ CV Distribution", callback_data="cvdist")])
-    if is_tanker:
-        # под каждой танкерной вакансией — отдельная кнопка на канал
-        # танкерных вакансий (сейчас указывает туда же, куда и обычный
-        # канал, пока не завели отдельный — см. TANKER_CHANNEL_USERNAME)
-        rows.append([InlineKeyboardButton(text="🛢 Канал танкерных вакансий", url=TANKER_CHANNEL_LINK)])
-    if include_menu:
-        # эта кнопка — только для личных сообщений бота подписчику (backfill,
-        # уведомления о новой вакансии). В САМОМ канале её не показываем —
-        # там её видят вообще все читатели канала, а не только те, кто уже
-        # общается с ботом, так что "Manage Subscription" там неуместна
-        rows.append([InlineKeyboardButton(text="📋 Main Menu / Manage Subscription",
-                                           url=f"https://t.me/{BOT_USERNAME}?start=menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-
-# Куда ведёт кнопка "I would like to send my cv to companies" — личка человека, который обрабатывает заказы рассылки резюме. Можно сменить без правки кода: CV_DIST_CONTACT_URL в Railway.
-CV_DIST_CONTACT_URL = os.getenv("CV_DIST_CONTACT_URL", "https://t.me/cvsenderforsea")
-
-
-@router.callback_query(F.data == "cvdist")
-async def cb_cv_distribution(callback: CallbackQuery):
-    # Эта кнопка висит под постами в САМОМ канале — callback.message там это
-    # пост канала, а не личка нажавшего. callback.message.answer() слал ответ
-    # в тот же чат, то есть публиковал это сообщение в канал всем 4000+
-    # подписчикам при каждом нажатии кем угодно. Нужно личным сообщением.
-    try:
-        await callback.bot.send_message(
-            callback.from_user.id,
-            "✉️ <b>CV Distribution</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="I would like to send my cv to companies", url=CV_DIST_CONTACT_URL)],
-                [InlineKeyboardButton(text="⬅️ Back to main menu", url=f"https://t.me/{BOT_USERNAME}?start=menu")],
-            ]),
+def channel_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🎯 Get Matched Jobs", url=f"https://t.me/{BOT_USERNAME}?start=join"
         )
-        await callback.answer()
-    except TelegramAPIError:
-        # бот ещё не может писать этому человеку — он не нажимал Start.
-        # Короткий алерт прямо на кнопке, без постов в канал.
-        await callback.answer(
-            f"Откройте @{BOT_USERNAME} и нажмите Start, чтобы получить это в личку",
-            show_alert=True,
-        )
+    ]])
+
 
 
 def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -971,19 +583,13 @@ def draft_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
 
 def queue_delay_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
     # выбор задержки показывается только ПОСЛЕ нажатия «В очередь» —
-    # ничего не публикуется и не планируется до этого второго нажатия.
-    # 1-8 часов, чтобы можно было равномерно распределить публикации на
-    # весь день, а не только 1/2/6/12
-    rows = []
-    row = []
-    for h in range(1, 9):
-        row.append(InlineKeyboardButton(text=f"{h}ч", callback_data=f"queuedelay:{vacancy_id}:{h}"))
-        if len(row) == 4:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    # ничего не публикуется и не планируется до этого второго нажатия
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="1ч", callback_data=f"queuedelay:{vacancy_id}:1"),
+        InlineKeyboardButton(text="2ч", callback_data=f"queuedelay:{vacancy_id}:2"),
+        InlineKeyboardButton(text="6ч", callback_data=f"queuedelay:{vacancy_id}:6"),
+        InlineKeyboardButton(text="12ч", callback_data=f"queuedelay:{vacancy_id}:12"),
+    ]])
 
 
 def duplicate_keyboard(vacancy_id: int) -> InlineKeyboardMarkup:
@@ -1028,72 +634,24 @@ def next_digest_slot() -> datetime:
     return (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-async def _publish_to_channel(bot: Bot, chat_id: str, text: str, caption: str,
-                               vacancy_id: int, is_tanker: bool, bare: bool = False) -> int:
-    """Публикует один пост в указанный канал. bare=True — только чистый
-    текст вакансии, вообще без кнопок, баннера и ссылок на другие каналы
-    (используется для канала танкеров)."""
-    if bare:
-        sent = await bot.send_message(
-            chat_id=chat_id, text=text, link_preview_options=NO_PREVIEW,
-        )
-        return sent.message_id
-
-    keyboard = channel_keyboard(vacancy_id, is_tanker=is_tanker, include_menu=False)
-    if os.path.isfile(CHANNEL_BANNER_PATH):
-        try:
-            sent = await bot.send_photo(
-                chat_id=chat_id, photo=FSInputFile(CHANNEL_BANNER_PATH),
-                caption=caption, reply_markup=keyboard,
-            )
-            return sent.message_id
-        except Exception as e:
-            # ловим любую ошибку при отправке фото (сетевой сбой, битый файл
-            # и т.д.), а не только TelegramAPIError — публикация не должна
-            # падать целиком из-за проблем с баннером, максимум теряем картинку
-            print(f"[do_publish] Не удалось опубликовать фото+подпись в {chat_id}, публикую текстом: {e}")
-    sent = await bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=keyboard, link_preview_options=NO_PREVIEW,
-    )
-    return sent.message_id
-
-
 async def do_publish(bot: Bot, vacancy_id: int):
     row = db.get_vacancy(vacancy_id)
     fields = dict(row)
-    text = render_template(fields)  # полный текст — идёт в личные рассылки подписчикам
-    caption = render_caption(fields)  # ужатая версия под лимит подписи к фото (1024 симв.)
+    text = render_template(fields)
 
-    # Флот вакансии определяет, в какой канал она идёт — ровно в один:
-    # Tanker (включая LNG/LPG-газовозы) -> канал танкеров, всё остальное
-    # (Merchant + Offshore) -> основной канал. Никакого дублирования.
-    is_tanker = fields.get("fleet_tag") == "Tanker"
-    target_channel = TANKER_CHANNEL_ID if is_tanker else CHANNEL_ID
-    # для канала танкеров — отдельный текст без ссылки на основной канал
-    # в конце (она вела бы не туда, где сам пост и лежит)
-    publish_text = render_template(fields, show_channel_link=not is_tanker) if is_tanker else text
-
-    message_id = await _publish_to_channel(
-        bot, target_channel, publish_text, caption, vacancy_id, is_tanker, bare=is_tanker
+    sent = await bot.send_message(
+        chat_id=CHANNEL_ID, text=text,
+        reply_markup=channel_keyboard(vacancy_id),
     )
-    db.set_status(vacancy_id, "published", message_id)
+    db.set_status(vacancy_id, "published", sent.message_id)
 
-    # публикация в канал уже состоялась и подтверждена выше — админ должен
-    # увидеть "✅ Опубликовано" сразу, не дожидаясь рассылки всем
-    # подписчикам (это могло занимать долго при большой базе и выглядело как
-    # зависшая кнопка). Рассылка и черновики откликов уходят в фон.
-    asyncio.create_task(_post_publish_background(bot, vacancy_id, fields))
-
-
-async def _post_publish_background(bot: Bot, vacancy_id: int, fields: dict):
+    # публикация в канал уже состоялась и подтверждена выше — рассылка
+    # подписчикам оборачивается отдельно, чтобы её сбой ни в коем случае
+    # не выглядел как ошибка самой публикации
     try:
         await notify_subscribers(bot, vacancy_id, fields)
     except Exception as e:
         print(f"[do_publish] Рассылка подписчикам не удалась (публикация в канал прошла успешно): {e}")
-    try:
-        await email_apply.propose_for_vacancy(bot, vacancy_id)
-    except Exception as e:
-        print(f"[do_publish] Черновики email-откликов не созданы: {e}")
 
 
 @router.message(Command("start"))
@@ -1138,10 +696,26 @@ async def cmd_start(message: Message, command: CommandObject):
     if admin_only(message.from_user.id):
         mode = "включена" if is_auto_publish() else "выключена"
         await message.answer(
-            f"Пришлите текст вакансии в любом формате (или пачку через ---) — опубликую. "
-            f"Автопубликация сейчас {mode} (переключить: /autopublish on|off).\n\n"
-            "Ниже — меню по разделам, в каждом подробно расписано, как это работает.",
-            reply_markup=admin_menu_keyboard(),
+            "Пришлите текст вакансии в любом формате (или пачку через ---).\n"
+            "Команды:\n"
+            "/stats — сводка за сегодня (/stats 7 — за 7 дней)\n"
+            "/contacts — список email/агентств из сохранённых вакансий\n"
+            "/testchannel — проверить доступ бота к каналу\n"
+            "/ad — опубликовать рекламный пост с кнопкой «Консультация»\n"
+            "/search — открыть поиск вакансий с фильтрами (мини-приложение)\n"
+            "/applications — последние отклики через мини-приложение\n"
+            "/subscribe — команда для кандидатов: подписка на вакансии по должности "
+            "(доступна любому, не только вам)\n"
+            "/subscribers — сколько людей подписалось и разбивка по должностям\n"
+            "/subscriberslist — полный список подписчиков (ник, должности, статус оплаты)\n"
+            "/getemails — платный email-дайджест за неделю (доступна любому, не только вам)\n"
+            "/grant [@ник или id] [дней] — выдать доступ вручную, если оплатили не через Stars\n"
+            "/revoke [@ник или id] — отписать вручную, доступ прекращается немедленно\n"
+            "/refund [@ник или id] — вернуть последний неоплаченный возвратом платёж\n"
+            "/revenue [дней] — доход в Stars за период (по умолчанию 7 дней)\n"
+            "/blockuser [@ник или id] — заблокировать (бот перестанет отвечать)\n"
+            "/unblockuser [@ник или id] — снять блокировку\n"
+            f"/autopublish on|off — автопубликация без подтверждения (сейчас {mode})"
         )
         # email-дайджест за неделю — только тебе, никто другой это не увидит.
         # Обёрнуто в try/except: если тут что-то сломается, это не должно
@@ -1174,15 +748,6 @@ async def cmd_start(message: Message, command: CommandObject):
         except ValueError:
             pass
 
-    # диплинк «📋 Main Menu / Manage Subscription» из-под поста в канале —
-    # сразу открываем управление подпиской на уже выбранном языке (без
-    # повторного выбора языка при каждом нажатии). Если должности уже
-    # зафиксированы — покажет "напишите админу для смены", это ожидаемо.
-    if command.args == "menu" and db.get_subscriber_language(tg_id):
-        lang = db.get_subscriber_language(tg_id)
-        await show_department_or_paywall(message, tg_id, lang, edit=False)
-        return
-
     # Онбординг начинается с выбора языка.
     await message.answer(
         "🇬🇧 English / 🇷🇺 Русский / 🇺🇦 Українська",
@@ -1191,31 +756,19 @@ async def cmd_start(message: Message, command: CommandObject):
 
 
 def payment_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = []
+    rows = [[InlineKeyboardButton(
+        text=t(lang, "pay_button", price=SUBSCRIPTION_PRICE_STARS),
+        callback_data=f"pay_sub:{SUBSCRIPTION_DAYS}:{SUBSCRIPTION_PRICE_STARS}",
+    )]]
     if STRIPE_PAYMENT_LINK and tg_id:
         # client_reference_id — единственный способ Stripe сообщить вебхуком,
         # какому именно tg_id принадлежит платёж
         stripe_url = f"{STRIPE_PAYMENT_LINK}?client_reference_id={tg_id}"
         rows.append([InlineKeyboardButton(text=t(lang, "pay_button_card"), url=stripe_url)])
-    rows.append([InlineKeyboardButton(text="💳 Card (UAH)", callback_data="pay_uah")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
-    rows.append([InlineKeyboardButton(text="🆔 My ID", callback_data="showmyid")])
     rows.append([InlineKeyboardButton(text=t(lang, "pay_contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-UAH_CARD_NUMBER = os.getenv("UAH_CARD_NUMBER", "5358 3808 8089 8138")
-
-
-@router.callback_query(F.data == "pay_uah")
-async def cb_pay_uah(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.answer(
-        f"💳 Оплата картой в гривне:\n<code>{UAH_CARD_NUMBER}</code>\n\n"
-        f"После оплаты скопируйте свой ID (кнопка «🆔 My ID») и пришлите администратору — "
-        f"доступ откроем вручную."
-    )
 
 
 async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit: bool):
@@ -1229,13 +782,9 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
         # у человека вообще никогда не было ни триала, ни оплаты — выдаём
         # 3 дня бесплатно без всякой привязки карты, сразу к выбору должностей
         if db.start_trial_if_new(tg_id, TRIAL_DAYS):
-            # свежий человек, только что начал триал — объясняем, что вообще
-            # умеет бот, ДО того как покажем выбор должностей, иначе люди
-            # просто не понимают, зачем всё это и куда попали
-            await target.answer(t(lang, "bot_intro"))
             selected = set(db.get_subscriber_positions(tg_id))
             text = t(lang, "trial_started", days=TRIAL_DAYS)
-            markup = fleet_keyboard(lang, selected)
+            markup = department_keyboard(lang, selected)
         else:
             # триал уже был использован (или истекла платная подписка) —
             # теперь показываем настоящий экран оплаты
@@ -1243,12 +792,11 @@ async def show_department_or_paywall(target, tg_id: int, lang: str | None, edit:
             markup = payment_keyboard(lang, tg_id)
     elif db.is_positions_locked(tg_id):
         selected = db.get_subscriber_positions(tg_id)
-        tags_str = ", ".join(f"{tag} ({fleet})" for tag, fleet in selected)
-        text = t(lang, "positions_locked_notice", tags=tags_str)
+        text = t(lang, "positions_locked_notice", tags=", ".join(selected))
         markup = after_subscribe_keyboard(lang, tg_id)
     else:
         selected = set(db.get_subscriber_positions(tg_id))
-        text, markup = t(lang, "choose_fleet"), fleet_keyboard(lang, selected)
+        text, markup = t(lang, "choose_department"), department_keyboard(lang, selected)
     if edit:
         await target.edit_text(text, reply_markup=markup)
     else:
@@ -1266,12 +814,6 @@ async def cb_pay_subscription(callback: CallbackQuery):
         return
     _, days_str, price_str = callback.data.split(":")
     days, price = int(days_str), int(price_str)
-    # days/price приходят из callback_data, которую любой клиент Telegram
-    # может подделать (например "pay_sub:365:1" — 365 дней за 1 звезду) —
-    # сверяем с единственной легитимной парой, а не доверяем присланному
-    if (days, price) != (SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS):
-        await callback.answer("Эта ссылка на оплату устарела, оформите заново: /subscribe", show_alert=True)
-        return
     await callback.bot.send_invoice(
         chat_id=tg_id,
         title=f"CV Sender — Job Alerts ({days} days)",
@@ -1285,11 +827,12 @@ async def cb_pay_subscription(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.message(Command("getemails"))
 def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=t(lang, "digest_count_button"), callback_data="digest_count")],
-        [InlineKeyboardButton(text=t(lang, "digest_demo_button"), callback_data="digest_demo")],
-    ]
+    rows = [[InlineKeyboardButton(
+        text=t(lang, "digest_pay_button", price=EMAIL_DIGEST_PRICE_STARS),
+        callback_data="pay_digest",
+    )]]
     if STRIPE_DIGEST_PAYMENT_LINK and tg_id:
         # digest_ префикс в client_reference_id — так вебхук в webapp.py
         # отличает разовую покупку дайджеста от продления подписки
@@ -1299,52 +842,6 @@ def digest_keyboard(lang: str | None = None, tg_id: int | None = None) -> Inline
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.callback_query(F.data == "digest_count")
-async def cb_digest_count(callback: CallbackQuery):
-    lang = db.get_subscriber_language(callback.from_user.id)
-    # считаем уникальные email, а не сырые строки контактов — иначе цифра тут
-    # не совпадает с тем, что реально приходит после оплаты (там именно email)
-    contacts = db.list_contacts_since(7)
-    count = len({extract_email(c) for c in contacts if extract_email(c)})
-    await callback.answer(t(lang, "digest_count_result", count=count), show_alert=True)
-
-
-DIGEST_DEMO_MAX_CLICKS = 2
-
-
-@router.callback_query(F.data == "digest_demo")
-async def cb_digest_demo(callback: CallbackQuery):
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
-        return
-    lang = db.get_subscriber_language(tg_id)
-    clicks = db.get_digest_demo_clicks(tg_id)
-    if clicks >= DIGEST_DEMO_MAX_CLICKS:
-        # иначе можно нажимать бесконечно и по кусочкам бесплатно выкачать
-        # весь список — 5 штук за раз, но не больше 2 раз всего
-        await callback.answer(t(lang, "digest_demo_limit_reached"), show_alert=True)
-        return
-    contacts = db.list_contacts_since(7)
-    # раньше тут брался случайный РАЗДЕЛ сырого поля "контакт" целиком — в нём
-    # мог быть телефон/WhatsApp-ссылка/имя в скобках вперемешку с email, как и
-    # в полном платном дайджесте, здесь нужен именно email, ничего больше
-    emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
-    if not emails:
-        await callback.answer(t(lang, "digest_empty"), show_alert=True)
-        return
-    sample = random.sample(emails, min(5, len(emails)))
-    lines = "\n".join(f"• {e}" for e in sample)
-    db.increment_digest_demo_clicks(tg_id)
-    await callback.answer()
-    left = DIGEST_DEMO_MAX_CLICKS - clicks - 1
-    await callback.message.answer(
-        t(lang, "digest_demo_result", count=len(emails), sample=lines)
-        + "\n\n" + t(lang, "digest_demo_left", left=left)
-    )
-
-
-@router.message(Command("getemails"))
 async def cmd_get_emails(message: Message):
     # доступно всем, не только тебе — это платный продукт для кандидатов/
     # других крюингов, отдельный от основной подписки на вакансии
@@ -1400,33 +897,15 @@ async def deliver_email_digest(bot: Bot, tg_id: int, charge_id: str,
                                 amount=None, currency: str = "XTR", provider: str = "stars"):
     """Общая точка доставки купленного дайджеста — используется и для оплаты
     звёздами, и для Stripe."""
-    if db.payment_exists(charge_id):
-        # повторная доставка вебхука на один и тот же платёж — иначе дайджест
-        # уходил бы человеку второй раз на каждый повтор уведомления
-        print(f"[deliver_email_digest] charge_id={charge_id} уже обработан, пропускаю повтор")
-        return
     amount = amount if amount is not None else EMAIL_DIGEST_PRICE_STARS
     db.insert_payment(tg_id, amount, 0, charge_id, provider=provider, currency=currency)
     lang = db.get_subscriber_language(tg_id)
     contacts = db.list_contacts_since(7)
     emails = sorted({extract_email(c) for c in contacts if extract_email(c)})
     if emails:
-        # Telegram режет сообщения длиннее ~4096 символов — при большом
-        # списке email одним сообщением не влезет, поэтому шлём заголовок
-        # отдельно, а сами адреса чанками по TELEGRAM_MSG_LIMIT символов
-        await bot.send_message(tg_id, t(lang, "digest_delivered", count=len(emails)))
-        TELEGRAM_MSG_LIMIT = 3500  # с запасом от жёсткого лимита в 4096
-        chunk: list[str] = []
-        chunk_len = 0
-        for email in emails:
-            if chunk_len + len(email) + 1 > TELEGRAM_MSG_LIMIT and chunk:
-                await bot.send_message(tg_id, "\n".join(chunk))
-                await asyncio.sleep(0.2)
-                chunk, chunk_len = [], 0
-            chunk.append(email)
-            chunk_len += len(email) + 1
-        if chunk:
-            await bot.send_message(tg_id, "\n".join(chunk))
+        await bot.send_message(
+            tg_id, t(lang, "digest_delivered", count=len(emails)) + "\n\n" + "\n".join(emails)
+        )
     else:
         await bot.send_message(tg_id, t(lang, "digest_empty"))
 
@@ -1454,12 +933,6 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
     Stars (process_successful_payment) или из Stripe (вебхук в webapp.py).
     Делает: запись платежа, продление подписки, разблокировку должностей,
     сообщение кандидату, реферальный бонус, уведомление админу."""
-    if db.payment_exists(charge_id):
-        # Stripe повторяет доставку уведомлений об одном и том же платеже —
-        # без этой проверки один платёж продлевал подписку (и реферальный
-        # бонус) дважды при повторной доставке того же события
-        print(f"[finalize_subscription_payment] charge_id={charge_id} уже обработан, пропускаю повтор")
-        return
     is_first_payment = db.count_payments(tg_id) == 0
     db.insert_payment(tg_id, amount, days, charge_id, provider=provider, currency=currency)
     new_until = db.extend_subscription(tg_id, days)
@@ -1470,7 +943,7 @@ async def finalize_subscription_payment(bot: Bot, tg_id: int, days: int, amount,
     try:
         await bot.send_message(
             tg_id, t(lang, "payment_thanks", until=until_str),
-            reply_markup=fleet_keyboard(lang, selected),
+            reply_markup=department_keyboard(lang, selected),
         )
     except TelegramAPIError:
         pass
@@ -1514,36 +987,13 @@ async def process_successful_payment(message: Message):
         await deliver_email_digest(message.bot, tg_id, sp.telegram_payment_charge_id)
         return
 
-    # payload — это просто строка, которую сами же формировали при выдаче
-    # инвойса; Telegram ничего в ней не проверяет и прислал бы её обратно
-    # любой, даже если бы инвойс был создан с подделанной ценой. Доверять
-    # можно только sp.total_amount — сумме, которую Telegram сам подтвердил
-    # как реально списанную. Дни считаем от неё, а не от того, что написано
-    # в payload (та самая "365 дней за 1 звезду", только теперь не пройдёт,
-    # даже если инвойс с неверной ценой всё же как-то создастся).
+    # payload несёт реальные дни/цену конкретного тарифа — не полагаемся на
+    # константы по умолчанию на случай если тарифы ещё поменяются
     try:
         _, _, days_str, price_str = payload.split("_")
-        claimed_days, claimed_price = int(days_str), int(price_str)
+        days, price = int(days_str), int(price_str)
     except (ValueError, AttributeError):
-        claimed_days, claimed_price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
-    price = sp.total_amount  # фактически списанная сумма — ей доверяем
-    if claimed_price == SUBSCRIPTION_PRICE_STARS and price == SUBSCRIPTION_PRICE_STARS:
-        days = SUBSCRIPTION_DAYS
-    else:
-        # сумма не совпала с единственным легитимным тарифом — пересчитываем
-        # дни пропорционально РЕАЛЬНО уплаченному, не тому, что заявлено в payload
-        price_per_day = SUBSCRIPTION_PRICE_STARS / SUBSCRIPTION_DAYS
-        days = max(1, round(price / price_per_day)) if price_per_day else SUBSCRIPTION_DAYS
-        for admin_id in ADMIN_IDS:
-            try:
-                await message.bot.send_message(
-                    admin_id,
-                    f"⚠️ Звёздная оплата с нестандартной суммой: {price} XTR (ожидалось "
-                    f"{SUBSCRIPTION_PRICE_STARS}) от {tg_id}, charge_id={sp.telegram_payment_charge_id}. "
-                    f"Выдал {days} дн. пропорционально оплате — проверьте вручную.",
-                )
-            except TelegramAPIError:
-                pass
+        days, price = SUBSCRIPTION_DAYS, SUBSCRIPTION_PRICE_STARS
 
     await finalize_subscription_payment(
         message.bot, tg_id, days, price, "XTR", sp.telegram_payment_charge_id,
@@ -1593,9 +1043,9 @@ async def cb_show_positions(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("fleet:"))
-async def cb_show_fleet(callback: CallbackQuery):
-    fleet_key = callback.data.split(":", 1)[1]
+@router.callback_query(F.data.startswith("subdept:"))
+async def cb_show_department(callback: CallbackQuery):
+    dept = callback.data.split(":", 1)[1]
     tg_id = callback.from_user.id
     if throttled(tg_id):
         await callback.answer()
@@ -1605,15 +1055,15 @@ async def cb_show_fleet(callback: CallbackQuery):
         await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
         await callback.answer()
         return
-    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
+    selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
-        t(lang, "choose_department"), reply_markup=department_keyboard(fleet_key, lang, selected)
+        t(lang, "choose_position"), reply_markup=subscribe_keyboard(dept, lang, selected)
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "fleetback")
-async def cb_fleet_back(callback: CallbackQuery):
+@router.callback_query(F.data == "subdeptback")
+async def cb_department_back(callback: CallbackQuery):
     tg_id = callback.from_user.id
     if throttled(tg_id):
         await callback.answer()
@@ -1621,41 +1071,7 @@ async def cb_fleet_back(callback: CallbackQuery):
     lang = db.get_subscriber_language(tg_id)
     selected = set(db.get_subscriber_positions(tg_id))
     await callback.message.edit_text(
-        t(lang, "choose_fleet"), reply_markup=fleet_keyboard(lang, selected)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("subdept:"))
-async def cb_show_department(callback: CallbackQuery):
-    fleet_key, dept = callback.data.split(":", 2)[1:]
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
-        return
-    lang = db.get_subscriber_language(tg_id)
-    if db.is_positions_locked(tg_id) or not db.is_subscription_active(tg_id):
-        await show_department_or_paywall(callback.message, tg_id, lang, edit=True)
-        await callback.answer()
-        return
-    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
-    await callback.message.edit_text(
-        t(lang, "choose_position"), reply_markup=subscribe_keyboard(fleet_key, dept, lang, selected)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("subdeptback:"))
-async def cb_department_back(callback: CallbackQuery):
-    fleet_key = callback.data.split(":", 1)[1]
-    tg_id = callback.from_user.id
-    if throttled(tg_id):
-        await callback.answer()
-        return
-    lang = db.get_subscriber_language(tg_id)
-    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_key.capitalize()}
-    await callback.message.edit_text(
-        t(lang, "choose_department"), reply_markup=department_keyboard(fleet_key, lang, selected)
+        t(lang, "choose_department"), reply_markup=department_keyboard(lang, selected)
     )
     await callback.answer()
 
@@ -1671,313 +1087,6 @@ async def cb_set_language(callback: CallbackQuery):
     await callback.message.edit_text(t(lang, "intro"))
     await show_department_or_paywall(callback.message, tg_id, lang, edit=False)
     await callback.answer()
-
-
-ADMIN_MENU_SECTIONS = {
-    "pub": ("📰 Публикация вакансий", (
-        "<b>Как это работает</b>\n"
-        "• Вставьте текст вакансии (или перешлите пост/фото с подписью) — Claude разберёт на поля "
-        "(должность, судно, флот, зарплата, контакт) и покажет черновик с кнопками «Опубликовать» / "
-        "«В очередь» / «Исправить» / «Отмена»\n"
-        "• Флот определяется по типу судна автоматически — Merchant/Offshore идут в основной канал, "
-        "Tanker (включая LNG/LPG) — в отдельный\n"
-        "• Похожая вакансия, которая уже публиковалась — помечается предупреждением, публикация "
-        "не блокируется, решение за вами\n"
-        "• CrewLink и ainostri.ro проверяются фоном сами (включаются/выключаются переменными "
-        "CREWLINK_ENABLED / AINOSTRI_ENABLED в Railway) — новые вакансии приходят вам черновиком "
-        "так же, как ручная вставка\n\n"
-        "<b>Если что-то пошло не так</b>\n"
-        "• «⚠️ не похоже на вакансию» — страница источника не разобралась (например, попался "
-        "cookie-баннер или не та страница) — проверьте ссылку вручную\n"
-        "• Нет баннера-картинки — публикуется текстом, не блокирует пост\n"
-        "• Отложенный пост не вышел — повтор через 15 минут, придёт отдельное сообщение\n\n"
-        "<b>Команды</b>\n"
-        "/autopublish on|off — публиковать без подтверждения\n"
-        "/testchannel — проверить доступ бота к обоим каналам\n"
-        "/unlockpositionsall — разблокировать выбор должностей всем подписчикам\n"
-        "/revokeallpositions confirm — снять должности у всех (после смены структуры)"
-    )),
-    "subs": ("👥 Подписчики и оплаты", (
-        "<b>Как это работает</b>\n"
-        "• Любой человек выбирает флот и должности в /subscribe — 3 дня бесплатно, дальше нужна "
-        "подписка, чтобы видеть контакт в вакансии (без неё вакансия видна, контакт скрыт)\n"
-        "• Подписчик получает только вакансии по своим должностям и флотам, даже если подписка "
-        "истекла — истечение скрывает контакт, не саму вакансию\n"
-        "• Реферальный бонус начисляется только за первую реальную оплату приглашённого\n\n"
-        "<b>Если что-то пошло не так</b>\n"
-        "• Оплатили не картой (наличные, перевод) — выдайте доступ вручную через /grant, это "
-        "засчитывается как реальная оплата (открывает контакты)\n"
-        "• Нужно вернуть деньги — /refund сам определяет, Stripe это была оплата или Stars, "
-        "и забирает доступ обратно после возврата\n\n"
-        "<b>Команды</b>\n"
-        "/subscribers, /subscriberslist — список и статистика\n"
-        "/grant [@user] [дней] — выдать доступ вручную\n"
-        "/extendall [дней] — продлить всем в подарок\n"
-        "/revoke [@user] — отозвать доступ немедленно\n"
-        "/refund [@user] — вернуть последний платёж и снять доступ\n"
-        "/blockuser, /unblockuser [@user]\n"
-        "/setposition [@user] [флот] [должности] — сменить вручную\n"
-        "/unlockpositions, /lockpositions [@user]\n"
-        "/testnotify [должность] [флот] — сколько подписчиков найдётся\n"
-        "/contacts, /getemails — выгрузка контактов из вакансий"
-    )),
-    "replies": ("📧 Отклики клиентов на вакансии", (
-        "<b>Как это работает</b>\n"
-        "• Клиент (моряк) подключает свою почту (пароль приложения) и выбирает должности — когда "
-        "выходит подходящая вакансия с email, бот сам пишет от его имени с приложенным CV\n"
-        "• Два режима: автоматически (🤖) или с подтверждением каждого письма (✋ Send/Edit/Skip)\n"
-        "• Текст письма каждый раз слегка перефразируется (Claude), факты не меняются\n"
-        "• Одному HR — одно письмо от клиента не чаще раза в сутки, даже если он попадётся в "
-        "нескольких вакансиях подряд\n\n"
-        "<b>Если что-то пошло не так</b>\n"
-        "• Почта не приняла пароль или подряд идут ошибки — автопауза на час, дальше сама "
-        "попробует снова\n"
-        "• Ящик упёрся в дневной лимит почтовика (Gmail и т.п.) — пауза на 24 часа, письма не "
-        "теряются, просто ждут\n\n"
-        "<b>Команды</b>\n"
-        "/mail — главное меню (клиенты, шаблоны, пароль, тест)\n"
-        "/addclient, /delclient, /clients, /clientshow [id]\n"
-        "/clientpos, /clientsubject, /clientletter, /clientcv, /clientpass, /clientsmtp, "
-        "/clientphone, /clientabout, /clientauto [id]\n"
-        "/testmail, /drafts, /sendall, /applyto, /backfill [id]\n"
-        "/mailsent, /mailhelp"
-    )),
-    "mb": ("🎯 Точечная рассылка по базе", (
-        "<b>Как запустить</b>\n"
-        "В /mail → карточка клиента → «🎯 Разослать точечно»: пришлите файл (.csv/.xlsx, email "
-        "в любом столбце) → выберите дату старта в календаре → окно времени (24ч) → интервал между "
-        "письмами — и только после этого кампания стартует\n\n"
-        "<b>Как бот шлёт</b>\n"
-        "• адреса в случайном порядке, интервал каждый раз ±15%\n"
-        "• до 350 писем кампании в день и 450 с ящика всего (вместе с обычными откликами) — "
-        "письма распределяются по окну равномерно\n"
-        "• на один корпоративный домен — не чаще раза в 20 мин, крупные почтовики без ограничения\n"
-        "• домены без почтового сервера и мусорные адреса (картинки вида logo@2x.png, noreply-ящики) "
-        "отсеиваются ещё до отправки\n"
-        "• после окончания окна — «Итог дня»: сколько ушло и сколько осталось\n\n"
-        "<b>Если что-то пошло не так</b>\n"
-        "• почта не принимает пароль или идут ошибки подряд → кампания на паузе 1 ч, потом "
-        "продолжит сама\n"
-        "• почта упёрлась в дневной лимит → ящик на паузе 24 ч, письма не теряются\n"
-        "• «такого адреса нет» / возврат «не доставлено» → адрес помечается 📭, в точечных "
-        "рассылках на него больше не шлём (отклики на вакансии это не трогает)\n\n"
-        "<b>Команды</b>\n"
-        "/mbcheck ID — сколько ушло, что не дошло, темп и прогноз\n"
-        "/mbstop ID — остановить · /mbresume ID — возобновить с теми же настройками\n"
-        "/bounces ID — недоставленные адреса этого клиента\n"
-        "/blast ID [дней] — отдельно: по HR из вакансий за N дней (не загруженная база)\n\n"
-        "ID клиента — в /mail, в карточке клиента."
-    )),
-    "ads": ("📣 Реклама и сообщения", (
-        "<b>Как это работает</b>\n"
-        "• /addad ставит ежедневную рекламу в заданное время — уходит в канал отдельным "
-        "сообщением, не чаще раза в день на объявление\n"
-        "• /broadcast и /broadcastuser сначала показывают превью с кнопками «Отправить» / "
-        "«Отмена» — ничего не уйдёт без подтверждения\n\n"
-        "<b>Команды</b>\n"
-        "/addad [main|tanker] [ЧЧ:ММ] [текст] — ежедневная реклама в канале\n"
-        "/listads, /deletead [id]\n"
-        "/broadcast [текст] — рассылка всем подписчикам, с превью\n"
-        "/broadcastuser [@user] [текст] — одному подписчику, с превью"
-    )),
-    "ops": ("🛠 Обслуживание", (
-        "<b>Как это работает</b>\n"
-        "• /health — состояние бота одной командой: аптайм, лежит ли база на Volume (важно — если "
-        "нет, данные пропадут при редеплое), размер базы, подписчики, клиенты, что включено\n"
-        "• /backup — копия базы файлом, делается безопасно (учитывает WAL-журнал, не просто "
-        "копирует файл) — плюс бот сам присылает её каждую ночь в 3:00 UTC\n\n"
-        "<b>Команды</b>\n"
-        "/health — состояние бота\n"
-        "/backup — копия базы сейчас\n"
-        "/stats [дней] — вакансии и отклики за период\n"
-        "/revenue [дней] — выручка"
-    )),
-}
-
-
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm:{key}")]
-            for key, (label, _) in ADMIN_MENU_SECTIONS.items()]
-    rows.append([
-        InlineKeyboardButton(text="🩺 Состояние", callback_data="adm_health"),
-        InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats"),
-        InlineKeyboardButton(text="👤 Клиенты", callback_data="adm_clients"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.message(Command("admin"))
-@router.message(Command("help"))
-async def cmd_admin(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer(
-        "🛠 <b>Меню администратора</b>\nВыберите раздел — покажу список команд.",
-        reply_markup=admin_menu_keyboard(),
-    )
-
-
-@router.callback_query(F.data.startswith("adm:"))
-async def cb_admin_section(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
-    key = callback.data.split(":", 1)[1]
-    section = ADMIN_MENU_SECTIONS.get(key)
-    if not section:
-        return await callback.answer()
-    label, body = section
-    # body — уже готовый HTML-текст (заголовки/списки), не список строк на экранирование
-    text = f"<b>{label}</b>\n\n{body}"
-    await callback.message.edit_text(
-        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm_back")]
-        ]),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "adm_back")
-async def cb_admin_back(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
-    await callback.message.edit_text(
-        "🛠 <b>Меню администратора</b>\nВыберите раздел — покажу список команд.",
-        reply_markup=admin_menu_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "adm_health")
-async def cb_admin_health(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
-    await callback.answer()
-    await cmd_health(callback.message, from_admin_button=True)
-
-
-@router.callback_query(F.data == "adm_stats")
-async def cb_admin_stats(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
-    await callback.answer()
-    s = db.daily_stats(1)
-    await callback.message.answer(f"📊 Опубликовано вакансий сегодня: {s['total']}\nПолная сводка: /stats [дней]")
-
-
-@router.callback_query(F.data == "adm_clients")
-async def cb_admin_clients(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
-    await callback.answer()
-    clients = email_apply.list_clients()
-    if not clients:
-        await callback.message.answer("Клиентов email-модуля пока нет. Добавить: /addclient")
-        return
-    lines = [f"👤 Клиентов: {len(clients)}\n"]
-    lines += [f"• #{c['id']} {c['full_name']} — {c['email']}" for c in clients[:30]]
-    if len(clients) > 30:
-        lines.append(f"…и ещё {len(clients) - 30}. Полный список: /clients")
-    await callback.message.answer("\n".join(lines))
-
-
-BOT_START_TIME = time.time()
-
-
-@router.message(Command("health"))
-async def cmd_health(message: Message, from_admin_button: bool = False):
-    if not from_admin_button and not admin_only(message.from_user.id):
-        return
-    uptime_sec = int(time.time() - BOT_START_TIME)
-    h, rem = divmod(uptime_sec, 3600)
-    m = rem // 60
-    db_path = db.DB_PATH
-    on_volume = db_path.startswith("/data")
-    db_size_mb = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
-    total_subs, _ = db.subscriber_stats()
-    try:
-        clients_n = len(email_apply.list_clients())
-    except Exception:
-        clients_n = "?"
-    lines = [
-        "🩺 <b>Состояние бота</b>",
-        f"Аптайм: {h}ч {m}мин",
-        f"База: <code>{html.escape(db_path)}</code> — "
-        + ("на Volume ✅" if on_volume else "⚠️ НЕ на Volume — данные потеряются при редеплое!"),
-        f"Размер базы: {db_size_mb:.1f} МБ",
-        f"Подписчиков: {total_subs}",
-        f"Клиентов email-модуля: {clients_n}",
-        f"Автопубликация: {'вкл' if is_auto_publish() else 'выкл'}",
-        f"CrewLink: {'вкл' if CREWLINK_ENABLED else 'выкл'} · ainostri: {'вкл' if AINOSTRI_ENABLED else 'выкл'}",
-        f"Каналы: @{CHANNEL_USERNAME}, @{TANKER_CHANNEL_USERNAME}",
-        f"Админов: {len(ADMIN_IDS)}",
-    ]
-    await message.answer("\n".join(lines))
-
-
-async def _make_db_backup(dest_path: str):
-    """sqlite3 .backup() вместо простого копирования файла — с WAL-режимом
-    часть данных может лежать в -wal, которого при обычном copy не будет."""
-    def _run():
-        src = sqlite3.connect(db.DB_PATH)
-        dest = sqlite3.connect(dest_path)
-        with dest:
-            src.backup(dest)
-        dest.close()
-        src.close()
-    await asyncio.to_thread(_run)
-
-
-async def _send_backup(bot: Bot, chat_id: int):
-    if not os.path.exists(db.DB_PATH):
-        await bot.send_message(chat_id, "❌ Файл базы не найден.")
-        return
-    tmp_path = f"/tmp/backup_{int(time.time())}.db"
-    try:
-        await _make_db_backup(tmp_path)
-        await bot.send_document(
-            chat_id,
-            FSInputFile(tmp_path, filename=f"backup_{datetime.now().strftime('%Y-%m-%d_%H%M')}.db"),
-            caption=f"💾 Бэкап базы — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC",
-        )
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
-@router.message(Command("backup"))
-async def cmd_backup(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await _send_backup(message.bot, message.chat.id)
-
-
-BACKUP_HOUR_UTC = int(os.getenv("BACKUP_HOUR_UTC", "3"))
-NIGHTLY_BACKUP_ENABLED = os.getenv("NIGHTLY_BACKUP_ENABLED", "false").lower() == "true"  # выключено — /backup вручную по-прежнему работает
-
-
-async def nightly_backup_worker(bot: Bot):
-    """Раз в сутки, в BACKUP_HOUR_UTC (по умолчанию 3:00 UTC), сама присылает
-    копию базы каждому админу — не нужно вспоминать про /backup вручную."""
-    if not NIGHTLY_BACKUP_ENABLED:
-        print("[nightly_backup_worker] Выключено (NIGHTLY_BACKUP_ENABLED=false)")
-        return
-    last_sent_date = None
-    while True:
-        try:
-            now = datetime.utcnow()
-            today = now.strftime("%Y-%m-%d")
-            if now.hour == BACKUP_HOUR_UTC and last_sent_date != today:
-                last_sent_date = today
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await _send_backup(bot, admin_id)
-                    except Exception as e:
-                        print(f"[nightly_backup_worker] не удалось отправить админу {admin_id}: {e}")
-        except Exception as e:
-            print(f"[nightly_backup_worker] ошибка итерации (воркер продолжает работать): {e}")
-        await asyncio.sleep(300)
 
 
 @router.message(Command("stats"))
@@ -2074,38 +1183,19 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def fleet_keyboard(lang: str | None = None, selected: list[tuple[str, str]] | None = None) -> InlineKeyboardMarkup:
-    # selected — список (position_tag, fleet_tag) из db.get_subscriber_positions();
-    # один и тот же тег может быть выбран сразу в нескольких флотах, поэтому
-    # считаем количество ПО КАЖДОМУ флоту отдельно, а не плоским множеством тегов
-    selected = selected or []
-    rows = []
-    for fleet_key, fleet in FLEETS.items():
-        fleet_tag = fleet_key.capitalize()
-        count = sum(1 for _, f in selected if f == fleet_tag)
-        label = f"{fleet['label']} ({count})" if count else fleet["label"]
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"fleet:{fleet_key}")])
-    rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
-    rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
-    rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
-    rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def department_keyboard(fleet_key: str, lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+def department_keyboard(lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
     selected = selected or set()
     rows = []
     row = []
-    for dept, tags in FLEETS[fleet_key]["departments"].items():
+    for dept, tags in DEPARTMENTS.items():
         count = len(selected & set(tags))
         label = f"{dept} ({count})" if count else dept
-        row.append(InlineKeyboardButton(text=label, callback_data=f"subdept:{fleet_key}:{dept}"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subdept:{dept}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text=t(lang, "back_to_fleets"), callback_data="fleetback")])
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
@@ -2113,23 +1203,22 @@ def department_keyboard(fleet_key: str, lang: str | None = None, selected: set[s
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def subscribe_keyboard(fleet_key: str, dept: str, lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
-    # клавиатура должностей ВНУТРИ одного департамента одного флота — оба
-    # закодированы в callback_data (subpos:<fleet>:<dept>:<tag>), чтобы
-    # toggle-хендлер знал, какой именно экран перерисовывать после нажатия
-    # и в рамках какого флота считать лимит MAX_POSITIONS_PER_FLEET
+def subscribe_keyboard(dept: str, lang: str | None = None, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+    # клавиатура должностей ВНУТРИ одного департамента — dept закодирован в
+    # callback_data (subpos:<dept>:<tag>), чтобы toggle-хендлер знал, какой
+    # именно экран перерисовывать после нажатия
     selected = selected or set()
     rows = []
     row = []
-    for tag in FLEETS[fleet_key]["departments"][dept]:
+    for tag in DEPARTMENTS[dept]:
         label = f"✅ {tag}" if tag in selected else tag
-        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{fleet_key}:{dept}:{tag}"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"subpos:{dept}:{tag}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text=t(lang, "back_to_departments"), callback_data=f"subdeptback:{fleet_key}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_to_departments"), callback_data="subdeptback")])
     rows.append([InlineKeyboardButton(text=t(lang, "done"), callback_data="subdone")])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
@@ -2146,17 +1235,8 @@ def after_subscribe_keyboard(lang: str | None = None, tg_id: int | None = None) 
         rows.append([InlineKeyboardButton(text=t(lang, "invite_friend"), url=share_url)])
     rows.append([InlineKeyboardButton(text="🌐 Change language", callback_data="showlang")])
     rows.append([InlineKeyboardButton(text=t(lang, "digest_menu_button"), callback_data="show_digest")])
-    rows.append([InlineKeyboardButton(text="🆔 My ID", callback_data="showmyid")])
     rows.append([InlineKeyboardButton(text=t(lang, "contact_admin"), url=CONSULT_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(F.data == "showmyid")
-async def cb_show_my_id(callback: CallbackQuery):
-    # человеку иногда нужно прислать админу свой numeric id (для /grant,
-    # /setposition и т.п.) — раньше для этого приходилось идти в отдельного
-    # бота типа @userinfobot
-    await callback.answer(f"Your Telegram ID: {callback.from_user.id}", show_alert=True)
 
 
 def consult_keyboard() -> InlineKeyboardMarkup:
@@ -2197,25 +1277,13 @@ async def handle_vacancy_text(message: Message):
         )
         return
 
-    await process_vacancy_text(message, message.text)
-
-
-async def process_vacancy_text(message: Message, raw_text: str):
-    """Общий разбор+публикация текста вакансии — вынесено отдельно, чтобы
-    один и тот же путь обрабатывал и обычный текст (message.text), и
-    подпись к фото (message.caption): пересланные вакансии из других
-    telegram-групп очень часто идут картинкой (лого агентства/компании) с
-    текстом вакансии в подписи, а не обычным текстовым сообщением."""
     status_msg = await message.answer("Разбираю...")
     auto = is_auto_publish()
-    # ai_parse_batch синхронный (блокирующий вызов Claude API, 10-60 сек) —
-    # без to_thread он замораживал ВЕСЬ бот на это время для всех
-    parsed = await asyncio.to_thread(ai_parse_batch, raw_text)
-    for fields in parsed:
+    for fields in ai_parse_batch(message.text):
         key = dedup_key_for(fields)
         dup = db.find_recent_duplicate(key)
 
-        vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
+        vacancy_id = db.insert_vacancy(fields, key, raw_text=message.text)
         text = render_template(fields)
 
         if dup:
@@ -2224,35 +1292,24 @@ async def process_vacancy_text(message: Message, raw_text: str):
                 f"⚠️ Похоже, такая вакансия уже публиковалась "
                 f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}"
             )
-            await message.answer(warn, reply_markup=duplicate_keyboard(vacancy_id), link_preview_options=NO_PREVIEW)
+            await message.answer(warn, reply_markup=duplicate_keyboard(vacancy_id))
             continue
 
         if auto:
             try:
                 await do_publish(message.bot, vacancy_id)
-                await message.answer(text + "\n\n✅ Опубликовано автоматически", link_preview_options=NO_PREVIEW)
+                await message.answer(text + "\n\n✅ Опубликовано автоматически")
             except TelegramAPIError as e:
                 await message.answer(
                     f"❌ Не удалось опубликовать автоматически: {e}\n\n{text}",
-                    reply_markup=draft_keyboard(vacancy_id), link_preview_options=NO_PREVIEW,
+                    reply_markup=draft_keyboard(vacancy_id),
                 )
         else:
             await message.answer(
                 text + "\n\n<i>Опубликовать сейчас или поставить в очередь дайджеста?</i>",
-                reply_markup=draft_keyboard(vacancy_id), link_preview_options=NO_PREVIEW,
+                reply_markup=draft_keyboard(vacancy_id),
             )
     await status_msg.delete()
-
-
-@router.message(F.photo & F.caption & ~F.caption.startswith("/"))
-async def handle_vacancy_photo_caption(message: Message):
-    """Пересланные вакансии из других групп часто идут картинкой (лого
-    агентства) с текстом вакансии в подписи — без этого обработчика такие
-    сообщения молча игнорировались (F.text не совпадал ни с чем, aiogram
-    просто не находил подходящий хэндлер, ни ошибки, ни ответа)."""
-    if not admin_only(message.from_user.id):
-        return
-    await process_vacancy_text(message, message.caption)
 
 
 @router.message(Command("ad"))
@@ -2324,413 +1381,16 @@ async def cmd_grant(message: Message, command: CommandObject):
     tg_id = row["tg_id"]
     new_until = db.extend_subscription(tg_id, days)
     db.unlock_positions(tg_id)
-    # /grant — это оплата не картой (наличка, перевод и т.п.), а не бесплатный
-    # подарок, поэтому пишем её в payments так же, как обычный платёж —
-    # иначе count_payments() не увидит эту оплату, и человеку продолжит
-    # скрываться контакт в вакансиях как будто он ничего не платил
-    db.insert_payment(tg_id, 0, days, f"manual_{int(time.time())}", provider="manual", currency="")
     until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
     await message.answer(f"✅ Выдал доступ на {days} дней. Активно до {until_str}.")
     lang = db.get_subscriber_language(tg_id)
     try:
         await message.bot.send_message(
             tg_id, t(lang, "payment_thanks", until=until_str),
-            reply_markup=fleet_keyboard(lang, set(db.get_subscriber_positions(tg_id))),
+            reply_markup=department_keyboard(lang, set(db.get_subscriber_positions(tg_id))),
         )
     except TelegramAPIError:
         pass
-
-
-@router.message(Command("extendall"))
-async def cmd_extend_all(message: Message, command: CommandObject):
-    """Массово продлевает доступ ВСЕМ подписчикам бота на N дней бесплатно —
-    например, в качестве акции или извинения за простой. Пример: /extendall 4"""
-    if not admin_only(message.from_user.id):
-        return
-    args = (command.args or "").strip()
-    if not args.isdigit():
-        await message.answer("Использование: /extendall [количество дней], например /extendall 4")
-        return
-    days = int(args)
-    people = db.get_subscribers_list()
-    if not people:
-        await message.answer("Подписчиков пока нет.")
-        return
-    status_msg = await message.answer(f"⏳ Продлеваю доступ {len(people)} подписчикам на {days} дней...")
-    notified = 0
-    for p in people:
-        tg_id = p["tg_id"]
-        new_until = db.extend_subscription(tg_id, days)
-        until_str = datetime.fromisoformat(new_until).strftime("%d.%m.%Y")
-        lang = db.get_subscriber_language(tg_id)
-        try:
-            if lang == "en":
-                extend_text = f"🎁 We're giving you {days} days of access as a gift! Active until {until_str}."
-            elif lang == "uk":
-                extend_text = f"Даємо доступ на {days} дні в подарунок 🎁\nАктивно до {until_str}."
-            else:
-                extend_text = f"Даем доступ на {days} дня в подарок 🎁\nАктивно до {until_str}."
-            await message.bot.send_message(tg_id, extend_text)
-            notified += 1
-            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
-        except TelegramAPIError:
-            pass
-    await status_msg.edit_text(
-        f"✅ Продлил доступ {len(people)} подписчикам на {days} дней "
-        f"(уведомление доставлено {notified} из {len(people)})."
-    )
-
-
-# храним рассылку (кому + текст) в памяти по tg_id админа (не в callback_data —
-# оно ограничено 64 байтами, длинный текст туда не влезет). target=None
-# означает "всем подписчикам", иначе — конкретный tg_id. Один админ может
-# держать только одну неподтверждённую рассылку одновременно
-_pending_broadcasts: dict[int, tuple[int | None, str]] = {}
-
-
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message, command: CommandObject):
-    """Рассылка произвольного текста ВСЕМ подписчикам бота — для объявлений
-    об обновлениях, техработах и т.п. Перед реальной отправкой показывает
-    превью текста и просит подтвердить, чтобы опечатка не улетела мгновенно
-    всей базе. Пример: /broadcast Добавили раздел Танкера! Загляните в /subscribe"""
-    if not admin_only(message.from_user.id):
-        return
-    text = (command.args or "").strip()
-    if not text:
-        await message.answer(
-            "Использование: /broadcast [текст сообщения]\n"
-            "Пример: /broadcast Добавили новый раздел Танкера! Загляните в /subscribe\n\n"
-            "Чтобы отправить одному человеку — /broadcastuser [@ник или id] [текст]"
-        )
-        return
-    people = db.get_subscribers_list()
-    if not people:
-        await message.answer("Подписчиков пока нет.")
-        return
-    _pending_broadcasts[message.from_user.id] = (None, text)
-    await message.answer(
-        f"Превью сообщения для {len(people)} подписчиков:\n\n{text}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Отправить всем", callback_data="bcast_confirm"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
-        ]]),
-    )
-
-
-@router.message(Command("broadcastuser"))
-async def cmd_broadcast_user(message: Message, command: CommandObject):
-    """То же самое, что /broadcast, но одному конкретному подписчику —
-    например, чтобы лично ответить/уточнить что-то, не трогая всех
-    остальных. Пример: /broadcastuser @ivan Ваш платёж пришёл, всё ок!"""
-    if not admin_only(message.from_user.id):
-        return
-    args = (command.args or "").split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: /broadcastuser [@username или id] [текст сообщения]")
-        return
-    handle, text = args
-    row = db.find_subscriber_by_handle(handle)
-    if not row:
-        await message.answer(f"Не нашёл {handle} в базе.")
-        return
-    tg_id = row["tg_id"]
-    _pending_broadcasts[message.from_user.id] = (tg_id, text)
-    await message.answer(
-        f"Превью сообщения для {handle}:\n\n{text}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Отправить", callback_data="bcast_confirm"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast_cancel"),
-        ]]),
-    )
-
-
-@router.message(Command("addad"))
-async def cmd_add_ad(message: Message, command: CommandObject):
-    """Ставит ежедневную рекламу в канал на фиксированное время — например,
-    промо бота, канала танкеров или услуг по трудоустройству. Шлётся
-    отдельным сообщением раз в день, ничего не приклеивается к вакансиям.
-    Пример: /addad main 18:00 🚢 Ищете работу в море? Подпишитесь на бота!"""
-    if not admin_only(message.from_user.id):
-        return
-    args = (command.args or "").split(maxsplit=2)
-    if len(args) < 3 or args[0] not in ("main", "tanker") or ":" not in args[1]:
-        await message.answer(
-            "Использование: /addad [main|tanker] [HH:MM] [текст рекламы]\n"
-            "Пример: /addad main 18:00 🚢 Ищете работу в море? Подпишитесь на бота: /start"
-        )
-        return
-    channel, time_hhmm, text = args
-    try:
-        h, m = map(int, time_hhmm.split(":"))
-        assert 0 <= h < 24 and 0 <= m < 60
-    except (ValueError, AssertionError):
-        await message.answer("Время должно быть в формате ЧЧ:ММ, например 18:00")
-        return
-    ad_id = db.add_scheduled_ad(channel, f"{h:02d}:{m:02d}", text)
-    channel_name = "канал танкеров" if channel == "tanker" else "основной канал"
-    await message.answer(f"✅ Реклама #{ad_id} добавлена — каждый день в {h:02d}:{m:02d} в {channel_name}.")
-
-
-@router.message(Command("listads"))
-async def cmd_list_ads(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    ads = db.list_scheduled_ads()
-    if not ads:
-        await message.answer("Запланированной рекламы пока нет.")
-        return
-    lines = ["📋 Запланированная реклама:"]
-    for ad in ads:
-        channel_name = "танкера" if ad["channel"] == "tanker" else "основной"
-        status = "" if ad["active"] else " (выключена)"
-        lines.append(f"#{ad['id']} — {ad['time_hhmm']} в {channel_name}{status}: {ad['text'][:60]}")
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("deletead"))
-async def cmd_delete_ad(message: Message, command: CommandObject):
-    if not admin_only(message.from_user.id):
-        return
-    arg = (command.args or "").strip()
-    if not arg.isdigit():
-        await message.answer("Использование: /deletead [id] — id смотрите в /listads")
-        return
-    db.delete_scheduled_ad(int(arg))
-    await message.answer(f"🗑 Реклама #{arg} удалена.")
-
-
-@router.callback_query(F.data == "bcast_cancel")
-async def cb_broadcast_cancel(callback: CallbackQuery):
-    _pending_broadcasts.pop(callback.from_user.id, None)
-    await callback.message.edit_text("Рассылка отменена.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "bcast_confirm")
-async def cb_broadcast_confirm(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        await callback.answer()
-        return
-    pending = _pending_broadcasts.pop(callback.from_user.id, None)
-    if not pending:
-        await callback.answer("Текст рассылки не найден — попробуйте /broadcast заново.", show_alert=True)
-        return
-    target, text = pending
-    await callback.answer()
-    if target is not None:
-        # одному конкретному человеку
-        try:
-            await callback.bot.send_message(target, text)
-            await callback.message.edit_text("✅ Отправлено.")
-        except TelegramAPIError as e:
-            await callback.message.edit_text(f"❌ Не удалось отправить: {e}")
-        return
-    people = db.get_subscribers_list()
-    await callback.message.edit_text(f"⏳ Отправляю {len(people)} подписчикам...")
-    sent = 0
-    for p in people:
-        try:
-            await callback.bot.send_message(p["tg_id"], text)
-            sent += 1
-            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
-        except TelegramAPIError:
-            pass
-    await callback.message.edit_text(f"✅ Отправлено {sent} из {len(people)} подписчиков.")
-
-
-@router.message(Command("testnotify"))
-async def cmd_test_notify(message: Message, command: CommandObject):
-    """Диагностика рассылки: показывает, сколько подписчиков будет найдено
-    для данной должности в данном флоте, без реальной отправки сообщений.
-    Пример: /testnotify Master merchant (флот: merchant/offshore/tanker)"""
-    if not admin_only(message.from_user.id):
-        return
-    args = (command.args or "").split()
-    if len(args) != 2 or args[1] not in FLEETS:
-        await message.answer(
-            "Использование: /testnotify [должность] [merchant|offshore|tanker]\n"
-            "Пример: /testnotify Master merchant"
-        )
-        return
-    tag, fleet_key = args
-    if tag not in RANK_TAGS:
-        await message.answer(f"⚠️ Тег «{tag}» не найден в текущем RANK_TAGS (проверьте написание).")
-        return
-    fleet_tag = fleet_key.capitalize()
-    matched = db.get_subscribers_for_tag(tag, fleet_tag)
-    lines = [
-        f"Тег: {tag}, флот: {fleet_tag}",
-        f"Найдено подписчиков: {len(matched)}",
-    ]
-    if matched:
-        lines.append("tg_id: " + ", ".join(str(x) for x in matched[:30]))
-        if len(matched) > 30:
-            lines.append(f"...и ещё {len(matched) - 30}")
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("setposition"))
-async def cmd_setposition(message: Message, command: CommandObject):
-    """Ручная смена должности подписчика в ОДНОМ флоте, в обход обычной
-    блокировки — используется, когда человек ошибся при выборе или хочет
-    сменить направление посреди оплаченного периода. Должности в других
-    флотах не трогает. Пример:
-    /setposition @ivan merchant Master,ChiefOfficer"""
-    if not admin_only(message.from_user.id):
-        return
-    args = (command.args or "").split(maxsplit=2)
-    if len(args) < 3 or args[1] not in FLEETS:
-        await message.answer(
-            "Использование: /setposition [@username или id] [merchant|offshore|tanker] "
-            "[должность1,должность2]\n"
-            "Пример: /setposition @ivan merchant Master,ChiefOfficer"
-        )
-        return
-    handle, fleet_key, tags_raw = args
-    fleet_tag = fleet_key.capitalize()
-    row = db.find_subscriber_by_handle(handle)
-    if not row:
-        await message.answer(f"Не нашёл {handle} в базе.")
-        return
-    tags = [tag.strip() for tag in tags_raw.split(",") if tag.strip()]
-    valid_tags_for_fleet = {tag for tags_ in FLEETS[fleet_key]["departments"].values() for tag in tags_}
-    unknown = [tag for tag in tags if tag not in valid_tags_for_fleet]
-    if unknown:
-        await message.answer(
-            f"Неизвестные для флота {fleet_tag} должности: {', '.join(unknown)}. Проверьте написание."
-        )
-        return
-    if len(tags) > MAX_POSITIONS_PER_FLEET:
-        await message.answer(f"Максимум {MAX_POSITIONS_PER_FLEET} должности на флот.")
-        return
-    tg_id = row["tg_id"]
-    db.clear_subscriber_positions(tg_id, fleet_tag)  # снимаем только в этом флоте
-    for tag in tags:
-        db.toggle_subscription(tg_id, tag, fleet_tag)
-    db.lock_positions(tg_id)
-    await message.answer(f"✅ Установил {handle} ({fleet_tag}): {', '.join(tags)}.")
-    lang = db.get_subscriber_language(tg_id)
-    try:
-        await message.bot.send_message(
-            tg_id, f"Ваши должности были изменены администратором: {', '.join(tags)}."
-        )
-    except TelegramAPIError:
-        pass
-
-
-@router.message(Command("unlockpositions"))
-async def cmd_unlock_positions(message: Message, command: CommandObject):
-    """Разблокирует выбор должностей конкретному подписчику — он сам заходит
-    в /subscribe и перевыбирает (в отличие от /setposition, где должности
-    назначает админ вручную). Текущий выбор при этом НЕ сбрасывается — просто
-    снимается блокировка, так что он может дозаполнить свободные слоты или
-    поменять что-то через обычный интерфейс. Пример: /unlockpositions @ivan"""
-    if not admin_only(message.from_user.id):
-        return
-    handle = (command.args or "").strip()
-    if not handle:
-        await message.answer("Использование: /unlockpositions [@username или id]")
-        return
-    row = db.find_subscriber_by_handle(handle)
-    if not row:
-        await message.answer(f"Не нашёл {handle} в базе.")
-        return
-    tg_id = row["tg_id"]
-    db.unlock_positions(tg_id)
-    await message.answer(f"🔓 Разблокировал выбор должностей для {handle}.")
-    lang = db.get_subscriber_language(tg_id)
-    try:
-        await message.bot.send_message(
-            tg_id,
-            "🔓 Администратор разблокировал вам выбор должностей — заходите в /subscribe, "
-            "чтобы изменить или дополнить выбор."
-        )
-    except TelegramAPIError:
-        pass
-
-
-@router.message(Command("lockpositions"))
-async def cmd_lock_positions(message: Message, command: CommandObject):
-    """Обратная команда — принудительно фиксирует текущий выбор должностей
-    подписчика (например, если /unlockpositions выдали по ошибке или хотят
-    зафиксировать выбор раньше следующей оплаты). Пример: /lockpositions @ivan"""
-    if not admin_only(message.from_user.id):
-        return
-    handle = (command.args or "").strip()
-    if not handle:
-        await message.answer("Использование: /lockpositions [@username или id]")
-        return
-    row = db.find_subscriber_by_handle(handle)
-    if not row:
-        await message.answer(f"Не нашёл {handle} в базе.")
-        return
-    tg_id = row["tg_id"]
-    db.lock_positions(tg_id)
-    await message.answer(f"🔒 Зафиксировал текущий выбор должностей для {handle}.")
-
-
-@router.message(Command("unlockpositionsall"))
-async def cmd_unlock_positions_all(message: Message, command: CommandObject):
-    """Массовая версия /unlockpositions — разблокирует выбор должностей
-    ВСЕМ подписчикам сразу (например, после большого обновления списка
-    должностей, чтобы все могли перевыбрать под новую структуру флотов).
-    Текущий выбор у каждого не сбрасывается, только снимается блокировка."""
-    if not admin_only(message.from_user.id):
-        return
-    people = db.get_subscribers_list()
-    if not people:
-        await message.answer("Подписчиков пока нет.")
-        return
-    status_msg = await message.answer(f"⏳ Разблокирую выбор должностей {len(people)} подписчикам...")
-    notified = 0
-    for p in people:
-        tg_id = p["tg_id"]
-        db.unlock_positions(tg_id)
-        try:
-            await message.bot.send_message(
-                tg_id,
-                "🔓 Администратор разблокировал вам выбор должностей — заходите в /subscribe, "
-                "чтобы изменить или дополнить выбор."
-            )
-            notified += 1
-            await asyncio.sleep(0.1)  # не спамим Telegram API пачкой без пауз
-        except TelegramAPIError:
-            pass
-    await status_msg.edit_text(
-        f"✅ Разблокировал выбор должностей {len(people)} подписчикам "
-        f"(уведомление доставлено {notified} из {len(people)})."
-    )
-
-
-@router.message(Command("revokeallpositions"))
-async def cmd_revoke_all_positions(message: Message, command: CommandObject):
-    """Полностью снимает ВСЕ выбранные должности у ВСЕХ подписчиков сразу
-    (во всех трёх флотах) — например, после смены структуры должностей,
-    чтобы все выбрали заново с нуля. НЕОБРАТИМО (история backfill_sent тоже
-    стирается — при повторном выборе той же должности бэкфилл придёт заново).
-    Требует подтверждения: сначала /revokeallpositions, затем
-    /revokeallpositions confirm."""
-    if not admin_only(message.from_user.id):
-        return
-    people = db.get_subscribers_list()
-    if not people:
-        await message.answer("Подписчиков пока нет.")
-        return
-    if (command.args or "").strip().lower() != "confirm":
-        await message.answer(
-            f"⚠️ Это снимет ВСЕ выбранные должности у ВСЕХ {len(people)} подписчиков "
-            f"(во всех флотах) без возможности отменить.\n\n"
-            f"Чтобы подтвердить: /revokeallpositions confirm"
-        )
-        return
-    status_msg = await message.answer(f"⏳ Снимаю должности у {len(people)} подписчиков...")
-    for p in people:
-        db.clear_subscriber_positions(p["tg_id"])
-        db.unlock_positions(p["tg_id"])
-    await status_msg.edit_text(
-        f"✅ Снял все должности у {len(people)} подписчиков. Они смогут выбрать заново через /subscribe."
-    )
 
 
 @router.message(Command("revoke"))
@@ -2771,26 +1431,15 @@ async def cmd_refund(message: Message, command: CommandObject):
     if not payment:
         await message.answer(f"У {handle} нет неоплаченных возвратом платежей.")
         return
-    # раньше ВСЕГДА пробовали звёздный возврат, даже если платёж был картой
-    # через Stripe — для Stripe это просто падало с ошибкой, возврат не
-    # проходил вообще никак
-    provider = payment["provider"] or "stars"
     try:
-        if provider == "stripe":
-            await asyncio.to_thread(stripe.Refund.create, payment_intent=payment["charge_id"])
-        else:
-            await message.bot.refund_star_payment(
-                user_id=row["tg_id"], telegram_payment_charge_id=payment["charge_id"]
-            )
-    except Exception as e:
-        await message.answer(f"❌ Не удалось вернуть ({provider}): {e}")
+        await message.bot.refund_star_payment(
+            user_id=row["tg_id"], telegram_payment_charge_id=payment["charge_id"]
+        )
+    except TelegramAPIError as e:
+        await message.answer(f"❌ Не удалось вернуть: {e}")
         return
     db.mark_payment_refunded(payment["id"])
-    # возврат оплаты раньше не снимал доступ — подписка оставалась активной
-    # до прежней даты окончания, хотя деньги уже вернули
-    db.revoke_subscription(row["tg_id"])
-    symbol = "⭐" if provider == "stars" else (payment["currency"] or "")
-    await message.answer(f"✅ Возвращено {payment['amount_stars']}{symbol} пользователю {handle}. Доступ снят.")
+    await message.answer(f"✅ Возвращено {payment['amount_stars']}⭐ пользователю {handle}.")
 
 
 @router.message(Command("revenue"))
@@ -2852,56 +1501,9 @@ async def cmd_subscribe(message: Message):
     await show_department_or_paywall(message, tg_id, lang, edit=False)
 
 
-@router.message(Command("mysubscription"))
-async def cmd_my_subscription(message: Message):
-    """Показывает кандидату, сколько дней осталось до конца подписки и когда
-    произойдёт следующее списание — доступно всем, не только админу."""
-    tg_id = message.from_user.id
-    until_raw = db.get_subscription_until(tg_id)
-    if not until_raw:
-        await message.answer("У вас пока нет активной подписки. Оформить: /subscribe")
-        return
-    until = datetime.fromisoformat(until_raw)
-    days_left = (until - datetime.now()).days
-    until_str = until.strftime("%d.%m.%Y")
-    if days_left < 0:
-        await message.answer(f"Ваша подписка закончилась {until_str}. Оформить снова: /subscribe")
-        return
-    text = f"📅 Ваша подписка активна до {until_str} (осталось {days_left} дн.)."
-    if STRIPE_PAYMENT_LINK:
-        text += "\n\nЕсли оплачивали картой — платёж продлевается автоматически. Отменить: /cancel"
-    await message.answer(text)
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel_subscription(message: Message):
-    """Самостоятельная отмена подписки — работает только для тех, кто платил
-    картой через Stripe (есть сохранённый stripe_customer_id). Для тех, кому
-    доступ выдал админ вручную (/grant) или кто платил как-то иначе, просим
-    написать админу — для них Stripe Portal не применим."""
-    tg_id = message.from_user.id
-    customer_id = db.get_stripe_customer_id(tg_id)
-    if not customer_id or not STRIPE_SECRET_KEY:
-        await message.answer(
-            "Не нашёл вашу оплату картой в Stripe — если оформляли подписку не картой, "
-            "для отмены напишите администратору."
-        )
-        return
-    try:
-        portal = stripe.billing_portal.Session.create(
-            customer=customer_id, return_url=f"https://t.me/{BOT_USERNAME}",
-        )
-        await message.answer(
-            "Управлять подпиской (отменить автопродление или посмотреть историю платежей) "
-            f"можно здесь:\n{portal.url}\n\nСсылка одноразовая, действует ограниченное время."
-        )
-    except Exception as e:
-        await message.answer(f"Не удалось создать ссылку на управление подпиской: {e}")
-
-
 @router.callback_query(F.data.startswith("subpos:"))
 async def cb_subscribe_position(callback: CallbackQuery):
-    _, fleet_key, dept, position_tag = callback.data.split(":", 3)
+    _, dept, position_tag = callback.data.split(":", 2)
     tg_id = callback.from_user.id
     if throttled(tg_id, seconds=1.0):
         await callback.answer()
@@ -2916,63 +1518,38 @@ async def cb_subscribe_position(callback: CallbackQuery):
         await callback.answer()
         return
 
-    fleet_tag = fleet_key.capitalize()  # "merchant" -> "Merchant" и т.д.
-    current = db.get_subscriber_positions(tg_id)  # список (position_tag, fleet_tag)
-    current_in_fleet = [tag for tag, f in current if f == fleet_tag]
-    if position_tag not in current_in_fleet:
-        # добавляем новую — лимит считаем ТОЛЬКО в рамках этого же флота,
-        # можно выбрать до MAX_POSITIONS_PER_FLEET в каждом из трёх разделов
-        # независимо
-        if len(current_in_fleet) >= MAX_POSITIONS_PER_FLEET:
-            await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS_PER_FLEET), show_alert=True)
-            return
+    current = db.get_subscriber_positions(tg_id)
+    if position_tag not in current and len(current) >= MAX_POSITIONS:
+        await callback.answer(t(lang, "max_positions", max=MAX_POSITIONS), show_alert=True)
+        return
 
-    is_active, should_backfill = db.toggle_subscription(tg_id, position_tag, fleet_tag)
+    added = db.toggle_subscription(tg_id, position_tag)
 
     # обновляем только галочки на клавиатуре этого же департамента — текст-
     # приглашение ("выберите должности...") остаётся тем же на протяжении
     # всего мульти-выбора
-    selected = {tag for tag, f in db.get_subscriber_positions(tg_id) if f == fleet_tag}
+    selected = set(db.get_subscriber_positions(tg_id))
     try:
-        await callback.message.edit_reply_markup(
-            reply_markup=subscribe_keyboard(fleet_key, dept, lang, selected)
-        )
+        await callback.message.edit_reply_markup(reply_markup=subscribe_keyboard(dept, lang, selected))
     except TelegramAPIError:
         pass  # клавиатура уже в нужном состоянии — Telegram иногда так отвечает, это не ошибка
 
-    if not is_active:
+    if not added:
         await callback.answer(t(lang, "unsubscribed", tag=position_tag))
         return
 
     await callback.answer(t(lang, "subscribed", tag=position_tag))
-    if not should_backfill:
-        # бэкфилл по этой должности уже отправляли раньше (человек снимал и
-        # выбрал снова) — не шлём повторно, чтобы не открывать дыру для
-        # накрутки вакансий через снятие/повторный выбор по кругу
-        return
-    backfill = list(db.get_recent_published_by_tag(position_tag, fleet_tag, days=BACKFILL_DAYS))
-    # обратное направление альяса: подписался на Master — получи в бэкфилле
-    # и недавние MasterSDPO-вакансии тоже (см. TAG_MATCH_ALIASES)
-    for alias_tag, targets in TAG_MATCH_ALIASES.items():
-        if position_tag in targets:
-            backfill += list(db.get_recent_published_by_tag(alias_tag, fleet_tag, days=BACKFILL_DAYS))
+    backfill = db.get_recent_published_by_tag(position_tag, days=7)
     if not backfill:
         await callback.bot.send_message(tg_id, t(lang, "backfill_empty", tag=position_tag))
         return
-    # контакт показываем только тем, кто хоть раз реально оплачивал — на
-    # бесплатном триале видно всю вакансию, кроме самого email/телефона
-    hide_contact = db.count_payments(tg_id) == 0
     for row in backfill:
-        if db.was_vacancy_sent(tg_id, row["id"]):
-            continue  # уже получал эту вакансию раньше (например, через notify_subscribers)
         fields = dict(row)
         try:
             await callback.bot.send_message(
-                tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
-                reply_markup=channel_keyboard(row["id"], is_tanker=fields.get("fleet_tag") == "Tanker"),
-                link_preview_options=NO_PREVIEW,
+                tg_id, render_template(fields),
+                reply_markup=channel_keyboard(row["id"]),
             )
-            db.mark_vacancy_sent(tg_id, row["id"])
             await asyncio.sleep(0.3)  # не спамим Telegram API пачкой без пауз
         except TelegramAPIError:
             pass
@@ -2990,9 +1567,8 @@ async def cb_subscribe_done(callback: CallbackQuery):
         await callback.answer(t(lang, "no_selection"), show_alert=True)
         return
     db.lock_positions(tg_id)  # с этого момента выбор нельзя изменить до следующей оплаты
-    tags_str = ", ".join(f"{tag} ({fleet})" for tag, fleet in selected)
     await callback.message.edit_text(
-        t(lang, "subscribed_summary", tags=tags_str),
+        t(lang, "subscribed_summary", tags=", ".join(selected)),
         reply_markup=after_subscribe_keyboard(lang, tg_id),
     )
     await callback.answer()
@@ -3004,40 +1580,17 @@ async def notify_subscribers(bot: Bot, vacancy_id: int, fields: dict):
     изолирована try/except-ом на уровне вызова — сбой рассылки никак не
     должен влиять на основную публикацию, которая на этот момент уже прошла."""
     position_tag = fields.get("position_tag")
-    fleet_tag = fields.get("fleet_tag")
-    if not position_tag or position_tag == FALLBACK_TAG or not fleet_tag:
+    if not position_tag or position_tag == FALLBACK_TAG:
         return
-    is_tanker = fleet_tag == "Tanker"
-    subscriber_ids = set(db.get_subscribers_for_tag(position_tag, fleet_tag))
-    for alias_tag in TAG_MATCH_ALIASES.get(position_tag, []):
-        subscriber_ids.update(db.get_subscribers_for_tag(alias_tag, fleet_tag))
-    print(f"[notify_subscribers] vacancy_id={vacancy_id} tag={position_tag} "
-          f"fleet={fleet_tag} найдено подписчиков: {len(subscriber_ids)}")
-    for tg_id in subscriber_ids:
-        if db.was_vacancy_sent(tg_id, vacancy_id):
-            continue  # уже отправляли именно эту вакансию этому человеку раньше
-        # контакт показываем только тем, кто хоть раз реально оплачивал — на
-        # бесплатном триале видно вакансию целиком, кроме email/телефона
-        hide_contact = db.count_payments(tg_id) == 0
-        lang = db.get_subscriber_language(tg_id)
-        # TelegramRetryAfter (флуд-контроль) раньше ловился тем же except
-        # TelegramAPIError и просто проглатывался — человек терял вакансию
-        # навсегда, без повторной попытки. Теперь ждём и шлём снова.
-        for attempt in range(2):
-            try:
-                await bot.send_message(
-                    tg_id, render_template(fields, hide_contact=hide_contact, lang=lang),
-                    reply_markup=channel_keyboard(vacancy_id, is_tanker=is_tanker),
-                    link_preview_options=NO_PREVIEW,
-                )
-                db.mark_vacancy_sent(tg_id, vacancy_id)
-                await asyncio.sleep(0.1)
-                break
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                continue  # повторяем попытку именно этому подписчику
-            except TelegramAPIError:
-                break
+    for tg_id in db.get_subscribers_for_tag(position_tag):
+        try:
+            await bot.send_message(
+                tg_id, render_template(fields),
+                reply_markup=channel_keyboard(vacancy_id),
+            )
+            await asyncio.sleep(0.1)
+        except TelegramAPIError:
+            pass
 
 
 @router.message(Command("search"))
@@ -3077,8 +1630,6 @@ async def cmd_applications(message: Message):
 
 @router.callback_query(F.data.startswith("adpub:"))
 async def cb_ad_publish(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     ad_id = int(callback.data.split(":")[1])
     text = ad_drafts.pop(ad_id, None)
     if not text:
@@ -3091,8 +1642,6 @@ async def cb_ad_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adcancel:"))
 async def cb_ad_cancel(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     ad_id = int(callback.data.split(":")[1])
     ad_drafts.pop(ad_id, None)
     await callback.message.edit_text("Отменено")
@@ -3122,15 +1671,7 @@ async def cmd_testchannel(message: Message):
 
 @router.callback_query(F.data.startswith("pub:"))
 async def cb_publish(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
-    # двойной клик по "Опубликовать" (или два админа одновременно) раньше
-    # публиковал вакансию дважды — статус 'published' это теперь блокирует
-    current = db.get_vacancy(vacancy_id)
-    if current and current["status"] == "published":
-        await callback.answer("Уже опубликовано")
-        return
     try:
         await do_publish(callback.bot, vacancy_id)
     except TelegramAPIError as e:
@@ -3147,8 +1688,6 @@ async def cb_publish(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queue:"))
 async def cb_queue(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     await callback.message.edit_reply_markup(reply_markup=queue_delay_keyboard(vacancy_id))
     await callback.answer()
@@ -3156,8 +1695,6 @@ async def cb_queue(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("queuedelay:"))
 async def cb_queue_delay(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     _, vacancy_id_str, hours_str = callback.data.split(":")
     vacancy_id, hours = int(vacancy_id_str), int(hours_str)
     slot = datetime.now() + timedelta(hours=hours)
@@ -3170,8 +1707,6 @@ async def cb_queue_delay(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     db.set_status(vacancy_id, "cancelled")
     await callback.message.edit_text("Отменено")
@@ -3180,8 +1715,6 @@ async def cb_cancel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fix:"))
 async def cb_fix(callback: CallbackQuery):
-    if not admin_only(callback.from_user.id):
-        return await callback.answer()
     vacancy_id = int(callback.data.split(":")[1])
     pending_corrections[callback.from_user.id] = vacancy_id
     await callback.message.answer(
@@ -3193,351 +1726,40 @@ async def cb_fix(callback: CallbackQuery):
 
 async def digest_worker(bot: Bot):
     while True:
-        # try/except раньше оборачивал только отправку КАЖДОГО поста — если
-        # падал сам db.get_due_queue (например при временном сбое базы),
-        # исключение вылетало из цикла целиком, и воркер умирал насовсем до
-        # следующего деплоя. Теперь ловим вообще всё тело итерации.
-        try:
-            due = db.get_due_queue(datetime.now().isoformat())
-            for row in due:
-                try:
-                    await do_publish(bot, row["id"])
-                except TelegramAPIError as e:
-                    # раньше при ошибке статус оставался 'queued', и тот же
-                    # пост пытался опубликоваться КАЖДУЮ минуту молча,
-                    # бесконечно — переносим на 15 минут и сообщаем админу
-                    db.set_schedule(row["id"], (datetime.now() + timedelta(minutes=15)).isoformat())
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            await bot.send_message(
-                                admin_id,
-                                f"❌ Отложенный пост id={row['id']} не опубликовался: {e}\n"
-                                f"Попробую снова через 15 минут.",
-                            )
-                        except TelegramAPIError:
-                            pass
-        except Exception as e:
-            print(f"[digest_worker] ошибка итерации (воркер продолжает работать): {e}")
+        due = db.get_due_queue(datetime.now().isoformat())
+        for row in due:
+            try:
+                await do_publish(bot, row["id"])
+            except TelegramAPIError:
+                pass
         await asyncio.sleep(60)
 
 
 async def subscription_reminder_worker(bot: Bot):
-    # проверяем раз в час; окно напоминания — 3 дня, чтобы предупредить
-    # заранее о предстоящем списании за следующий период
+    # проверяем раз в час — часто чаще и не нужно, окно напоминания 24ч
     while True:
-        try:
-            expiring = db.get_expiring_subscribers(within_hours=72)
-            for row in expiring:
-                lang = row["language"]
-                try:
-                    await bot.send_message(
-                        row["tg_id"],
-                        t(lang, "expiry_reminder"),
-                        reply_markup=payment_keyboard(lang, row["tg_id"]),
-                    )
-                    db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
-                except TelegramAPIError:
-                    pass
-        except Exception as e:
-            print(f"[subscription_reminder_worker] ошибка итерации (воркер продолжает работать): {e}")
-        await asyncio.sleep(3600)
-
-
-async def ad_scheduler_worker(bot: Bot):
-    """Раз в минуту проверяет, не пора ли отправить одну из запланированных
-    ежедневных реклам (см. /addad) в канал. Каждая реклама шлётся не чаще
-    одного раза в день, отдельным сообщением (без прикрепления вакансии)."""
-    while True:
-        try:
-            now = datetime.now()
-            current_hhmm = now.strftime("%H:%M")
-            today = now.strftime("%Y-%m-%d")
-            due = db.get_due_ads(current_hhmm, today)
-            for ad in due:
-                chat_id = TANKER_CHANNEL_ID if ad["channel"] == "tanker" else CHANNEL_ID
-                try:
-                    await bot.send_message(chat_id, ad["text"], link_preview_options=NO_PREVIEW)
-                    db.mark_ad_sent_today(ad["id"], today)
-                except TelegramAPIError as e:
-                    print(f"[ad_scheduler_worker] Не удалось отправить рекламу id={ad['id']}: {e}")
-        except Exception as e:
-            print(f"[ad_scheduler_worker] ошибка итерации (воркер продолжает работать): {e}")
-        await asyncio.sleep(60)
-
-
-CREWLINK_ENABLED = os.getenv("CREWLINK_ENABLED", "true").lower() == "true"
-CREWLINK_INTERVAL_MIN = int(os.getenv("CREWLINK_INTERVAL_MIN", "45"))
-CREWLINK_JOBS_URL = "https://crewlink.me/jobs"
-CREWLINK_JOB_ID_RE = re.compile(
-    r"/jobs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-)
-
-
-_JUNK_POSITION_RE = re.compile(
-    r"cookie|consent|gdpr|privacy polic|404|page not found|access denied|"
-    r"acord.*cookie|utiliz.*cookie",
-    re.IGNORECASE,
-)
-
-
-def looks_like_junk(fields: dict) -> bool:
-    """Похоже ли, что это НЕ настоящая вакансия, а мусор со страницы (cookie-
-    баннер, страница ошибки, пустая JS-заглушка) — сигналы: и должность, и
-    тип судна не распознались вообще (оба Other), либо в тексте должности
-    прямо видны признаки постороннего контента страницы."""
-    position_tag = fields.get("position_tag") or "Other"
-    vessel_tag = fields.get("vessel_tag") or "Other"
-    if position_tag == "Other" and vessel_tag == "Other":
-        return True
-    position_text = fields.get("position") or ""
-    if _JUNK_POSITION_RE.search(position_text):
-        return True
-    return False
-
-
-def strip_html_to_text(html: str) -> str:
-    """Грубая, но достаточная для наших целей очистка HTML в читаемый текст —
-    без внешних библиотек (BeautifulSoup и т.п. в зависимостях нет). Итоговый
-    текст идёт в тот же ai_parse_batch, что разбирает вакансии, присланные
-    админом руками, — не нужна идеальная структура, только читаемый текст."""
-    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
-    html = re.sub(r"</p>|</div>|</li>|</h[1-6]>", "\n", html, flags=re.IGNORECASE)
-    html = re.sub(r"<[^>]+>", " ", html)
-    html = (html.replace("&nbsp;", " ").replace("&amp;", "&")
-                .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
-    html = re.sub(r"[ \t]+", " ", html)
-    html = re.sub(r"\n\s*\n+", "\n", html)
-    text = html.strip()
-
-    # обрезаем собственную рекламу CrewLink в подвале страницы (одинаковая на
-    # каждой вакансии, не относится к самой вакансии) — всё, что после неё,
-    # тоже не нужно
-    cutoff = re.search(r"CrewLink\s*[–-]\s*Joburi Maritime", text, flags=re.IGNORECASE)
-    if cutoff:
-        text = text[:cutoff.start()].strip()
-
-    # вырезаем блоки cookie-баннеров/GDPR-текста целиком построчно — на
-    # некоторых сайтах (например ainostri.ro) это самый заметный текст на
-    # странице, и без вырезания Claude иногда путает его с самой вакансией
-    cookie_line_re = re.compile(
-        r"(cookie|consent for the use|acord.*cookie|utiliz.*cookie)", re.IGNORECASE
-    )
-    text = "\n".join(line for line in text.split("\n") if not cookie_line_re.search(line))
-
-    # убираем ссылки — целиком http(s)-адреса и голые www.-адреса, а не всю
-    # строку целиком (в строке рядом может быть полезный текст, например email)
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"\bwww\.\S+", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()
-
-
-async def generic_scraper_worker(bot: Bot, *, source: str, source_label: str, list_url: str,
-                                   extract_jobs, interval_min: int, enabled: bool,
-                                   first_run_sample: int | None = 2):
-    """Общий воркер для скрейпинга внешних job-бордов — раз в interval_min
-    минут проверяет list_url на новые вакансии, разбирает их через тот же
-    ai_parse_batch, что и обычные вакансии от админа, публикует по тем же
-    правилам (авто/черновик, дедупликация). Разные сайты подключаются через
-    extract_jobs(html_text) -> {job_id: job_url} — вся специфика конкретного
-    сайта (структура ссылок) остаётся в этой функции, воркер сам по себе
-    сайто-независимый.
-    Помечает каждую вакансию как "уже виденную" по её id, чтобы не разбирать
-    повторно при следующем проходе — id уникален В РАМКАХ source, поэтому
-    разные сайты не конфликтуют друг с другом даже при случайном совпадении id.
-    first_run_sample: на самом первом проходе для этого источника (когда ни
-    одной вакансии ещё не помечено виденной) обрабатывается только столько
-    вакансий для теста, а остальные из первой пачки просто помечаются
-    виденными без разбора — не нужен бэкфилл всей истории сайта ни для
-    одного источника, только новые вакансии начиная с этого момента.
-    По умолчанию 2 — это СТАНДАРТНОЕ поведение для КАЖДОГО источника,
-    существующего и любого нового, который будет добавлен позже; передавать
-    None стоит только если осознанно нужен полный бэкфилл при первом
-    запуске (обычно не нужен)."""
-    if not enabled:
-        print(f"[{source}_scraper_worker] Выключено")
-        return
-    await asyncio.sleep(30)  # даём боту полностью подняться перед первым проходом
-    async with httpx.AsyncClient(
-        timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; CVSenderJobBot/1.0)"}
-    ) as client:
-        while True:
+        expiring = db.get_expiring_subscribers(within_hours=24)
+        for row in expiring:
+            lang = row["language"]
             try:
-                resp = await client.get(list_url)
-                resp.raise_for_status()
-                jobs = extract_jobs(resp.text)  # {job_id: job_url}
-                new_ids = [j for j in jobs if not db.is_external_job_seen(source, j)]
-                is_first_run = first_run_sample is not None and not db.has_any_external_jobs_seen(source)
-                if is_first_run:
-                    # первый проход — берём только пробную выборку, остальное
-                    # из этой же пачки помечаем виденным молча, без разбора
-                    to_process = new_ids[:first_run_sample]
-                    to_skip = new_ids[first_run_sample:]
-                    for job_id in to_skip:
-                        db.mark_external_job_seen(source, job_id)
-                    print(f"[{source}_scraper_worker] Первый запуск: обрабатываю {len(to_process)} "
-                          f"для теста, помечаю виденными без разбора ещё {len(to_skip)}")
-                    new_ids = to_process
-                print(f"[{source}_scraper_worker] Найдено {len(jobs)} вакансий на странице, "
-                      f"новых к обработке: {len(new_ids)}")
-                auto = is_auto_publish()
-                for job_id in new_ids:
-                    job_url = jobs[job_id]
-                    try:
-                        job_resp = await client.get(job_url)
-                        job_resp.raise_for_status()
-                        raw_text = strip_html_to_text(job_resp.text)[:6000]
-                        parsed = await asyncio.to_thread(ai_parse_batch, raw_text)
-                        for fields in parsed:
-                            key = dedup_key_for(fields)
-                            dup = db.find_recent_duplicate(key)
-                            vacancy_id = db.insert_vacancy(fields, key, raw_text=raw_text)
-                            text = render_template(fields)
-                            source_note = f"\n\n🌐 Источник: {job_url}"
-                            if looks_like_junk(fields):
-                                # страница не похожа на нормальную вакансию (cookie-баннер,
-                                # ошибка сайта, пустая JS-заглушка и т.п.) — не публикуем и не
-                                # предлагаем как обычный черновик, а явно предупреждаем, чтобы
-                                # админ проверил страницу вручную, а не пропустил тихий мусор
-                                for admin_id in ADMIN_IDS:
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            f"⚠️ {source_label}: не похоже на нормальную вакансию "
-                                            f"(возможно, страница не разобралась корректно) — "
-                                            f"проверьте вручную.{source_note}\n\n{text}",
-                                            reply_markup=draft_keyboard(vacancy_id),
-                                            link_preview_options=NO_PREVIEW,
-                                        )
-                                    except TelegramAPIError:
-                                        pass
-                                db.mark_external_job_seen(source, job_id)
-                                continue
-                            if dup:
-                                for admin_id in ADMIN_IDS:
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            f"⚠️ {source_label}: похоже, уже публиковалось "
-                                            f"{dup['created_at'][:10]} (id {dup['id']}).\n\n{text}{source_note}",
-                                            reply_markup=duplicate_keyboard(vacancy_id),
-                                            link_preview_options=NO_PREVIEW,
-                                        )
-                                    except TelegramAPIError:
-                                        pass
-                                continue
-                            if auto:
-                                await do_publish(bot, vacancy_id)
-                                for admin_id in ADMIN_IDS:
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            f"✅ {source_label}: опубликовано автоматически{source_note}\n\n{text}",
-                                            link_preview_options=NO_PREVIEW,
-                                        )
-                                    except TelegramAPIError:
-                                        pass
-                            else:
-                                for admin_id in ADMIN_IDS:
-                                    try:
-                                        await bot.send_message(
-                                            admin_id,
-                                            f"🌐 Новая вакансия с {source_label}:{source_note}\n\n{text}",
-                                            reply_markup=draft_keyboard(vacancy_id),
-                                            link_preview_options=NO_PREVIEW,
-                                        )
-                                    except TelegramAPIError:
-                                        pass
-                        db.mark_external_job_seen(source, job_id)
-                        await asyncio.sleep(2)  # не долбим сайт подряд без пауз
-                    except Exception as e:
-                        print(f"[{source}_scraper_worker] Ошибка на вакансии {job_id}: {e}")
-                        # НЕ помечаем как seen — попробуем ещё раз в следующий проход
-            except Exception as e:
-                print(f"[{source}_scraper_worker] Ошибка при обходе списка вакансий: {e}")
-            await asyncio.sleep(interval_min * 60)
-
-
-def extract_crewlink_jobs(html_text: str) -> dict[str, str]:
-    ids = sorted(set(CREWLINK_JOB_ID_RE.findall(html_text)))
-    return {job_id: f"https://crewlink.me/jobs/{job_id}" for job_id in ids}
-
-
-CREWLINK_TEST_SAMPLE = int(os.getenv("CREWLINK_TEST_SAMPLE", "2"))  # сколько разобрать на самом первом проходе — дальше только по-настоящему новые (у уже работающего источника это не сработает повторно, т.к. история "виденных" уже есть)
-
-
-async def crewlink_scraper_worker(bot: Bot):
-    await generic_scraper_worker(
-        bot, source="crewlink", source_label="CrewLink", list_url=CREWLINK_JOBS_URL,
-        extract_jobs=extract_crewlink_jobs, interval_min=CREWLINK_INTERVAL_MIN,
-        enabled=CREWLINK_ENABLED, first_run_sample=CREWLINK_TEST_SAMPLE,
-    )
-
-
-AINOSTRI_ENABLED = os.getenv("AINOSTRI_ENABLED", "false").lower() == "true"  # выключено — слишком много "непохоже на вакансию"
-AINOSTRI_INTERVAL_MIN = int(os.getenv("AINOSTRI_INTERVAL_MIN", "45"))
-AINOSTRI_JOBS_URL = "https://www.ainostri.ro/job-offers/today-and-yesterday"
-# ссылка на карточку вакансии вида:
-# /job-offers/maritime/chief-officer-for-newbuilding-vlgc-dual-fuel-12940/today-and-yesterday
-# числовой id в конце слага уникален — используем его как ключ дедупликации.
-# Одна и та же вакансия может встретиться на странице под несколькими
-# разделами (maritime/cruise/offshore/ship-yard) с одним и тем же id —
-# берём первую попавшуюся ссылку для этого id, не разбираем дважды.
-# Раздел ship-yard — сухопутные вакансии судостроительного завода (сварщики,
-# слесари на верфи), это не члены экипажа судна — под наши теги должностей и
-# судов они в принципе не ложатся, только засоряют очередь "непохоже на
-# вакансию". Берём только реально морские разделы.
-AINOSTRI_CATEGORIES = ("maritime", "cruise", "offshore")
-AINOSTRI_JOB_RE = re.compile(
-    r"(/job-offers/(?:" + "|".join(AINOSTRI_CATEGORIES) + r")/[a-z0-9-]+-(\d+)/today-and-yesterday)"
-)
-
-
-def extract_ainostri_jobs(html_text: str) -> dict[str, str]:
-    jobs: dict[str, str] = {}
-    for path, job_id in AINOSTRI_JOB_RE.findall(html_text):
-        if job_id not in jobs:
-            jobs[job_id] = f"https://www.ainostri.ro{path}"
-    return jobs
-
-
-AINOSTRI_TEST_SAMPLE = int(os.getenv("AINOSTRI_TEST_SAMPLE", "2"))  # сколько разобрать на самом первом проходе (страница = "сегодня и вчера", без этого лимита в первый раз ушла бы вся пачка сразу)
-
-
-async def ainostri_scraper_worker(bot: Bot):
-    await generic_scraper_worker(
-        bot, source="ainostri", source_label="ainostri.ro", list_url=AINOSTRI_JOBS_URL,
-        extract_jobs=extract_ainostri_jobs, interval_min=AINOSTRI_INTERVAL_MIN,
-        enabled=AINOSTRI_ENABLED, first_run_sample=AINOSTRI_TEST_SAMPLE,
-    )
+                await bot.send_message(
+                    row["tg_id"],
+                    t(lang, "expiry_reminder"),
+                    reply_markup=payment_keyboard(lang, row["tg_id"]),
+                )
+                db.mark_reminder_sent(row["tg_id"], row["subscription_until"])
+            except TelegramAPIError:
+                pass
+        await asyncio.sleep(3600)
 
 
 async def main():
     db.init_db()
-    email_apply.init_tables()
-    # теги для модуля откликов по email — "Должность|Флот" для каждой
-    # существующей комбинации (та же структура, что и в /subscribe), метки
-    # берутся из POSITION_GROUPS внутри самого email_apply.py
-    mail_valid_tags = [
-        f"{tag}|{fleet_key.capitalize()}"
-        for fleet_key, fleet in FLEETS.items()
-        for tags in fleet["departments"].values()
-        for tag in tags
-    ]
-    email_apply.setup(ADMIN_IDS, claude, mail_valid_tags, {})
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(email_apply.router)  # раньше основного: его пошаговые диалоги должны ловить текст первыми
     dp.include_router(router)
     asyncio.create_task(digest_worker(bot))
     asyncio.create_task(subscription_reminder_worker(bot))
-    asyncio.create_task(ad_scheduler_worker(bot))
-    asyncio.create_task(crewlink_scraper_worker(bot))
-    asyncio.create_task(ainostri_scraper_worker(bot))
-    asyncio.create_task(email_apply.mail_base_worker(bot))
-    asyncio.create_task(nightly_backup_worker(bot))
 
     if WEBAPP_URL:
         asyncio.create_task(webapp.run_web_server(
@@ -3551,24 +1773,6 @@ async def main():
             print(f"[main] Не удалось установить кнопку меню мини-приложения: {e}")
     else:
         print("[main] WEBAPP_URL не задан — мини-приложение (поиск вакансий) не запущено")
-
-    # текст, который человек видит в ПУСТОМ чате с ботом ДО того, как нажал
-    # Start — Bot API это поддерживает напрямую, ставим один раз при
-    # каждом запуске (Telegram сам не даёт понять, изменился ли текст,
-    # так что дешевле просто переустанавливать каждый раз)
-    try:
-        await bot.set_my_short_description(
-            short_description="Присылает вакансии моряков по выбранной должности — Merchant/Offshore/Tanker."
-        )
-        await bot.set_my_description(
-            description=(
-                "🚢 Этот бот присылает вам вакансии по должности, которую вы выберете при "
-                "подписке — Торговый флот, Офшор или Танкера.\n\n"
-                "Бесплатно 3 дня, дальше — платная подписка. Нажмите Start, чтобы начать."
-            )
-        )
-    except TelegramAPIError as e:
-        print(f"[main] Не удалось установить описание бота: {e}")
 
     await dp.start_polling(bot)
 

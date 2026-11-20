@@ -13,14 +13,12 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 import stripe
-from aiogram.types import BufferedInputFile
 from aiohttp import web
 
 import db
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 STRIPE_SUBSCRIPTION_DAYS = 30  # держим в одном месте — совпадает с SUBSCRIPTION_DAYS в main.py
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -48,26 +46,6 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
     return parsed
 
 
-async def _notify_admin_unmatched_payment(bot, kind: str, ref: str, amount: float, currency: str, charge_id: str):
-    """Оплата прошла, но привязать её к конкретному tg_id не удалось —
-    вероятно, оплатили не по ссылке из бота, а по прямой ссылке Stripe.
-    Шлём админам детали, чтобы доставить дайджест/доступ вручную."""
-    text = (
-        f"⚠️ Оплата ({kind}) прошла, но получатель не определён — доставьте вручную.\n\n"
-        f"Сумма: {amount} {currency}\n"
-        f"charge_id: {charge_id}\n"
-        f"client_reference_id: {ref or '(пусто)'}\n\n"
-        f"Похоже, оплатили не по ссылке из бота — та добавляет ?client_reference_id "
-        f"автоматически. Найдите покупателя (email в Stripe Dashboard → Payments) "
-        f"и доставьте вручную через /grant или /broadcastuser."
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            pass
-
-
 def vacancy_to_dict(row) -> dict:
     def as_list(text):
         return [l for l in (text or "").split("\n") if l.strip()]
@@ -76,7 +54,6 @@ def vacancy_to_dict(row) -> dict:
         "id": row["id"],
         "position": row["position"],
         "position_tag": row["position_tag"],
-        "fleet_tag": row["fleet_tag"],
         "vessel": row["vessel"],
         "vessel_tag": row["vessel_tag"],
         "region": row["region"],
@@ -94,6 +71,13 @@ def vacancy_to_dict(row) -> dict:
 
 async def handle_filters(request: web.Request) -> web.Response:
     return web.json_response({"regions": db.distinct_regions()})
+
+
+async def handle_vacancies(request: web.Request) -> web.Response:
+    region = request.query.get("region", "").strip()
+    q = request.query.get("q", "").strip()
+    rows = db.search_published_vacancies(region=region, q=q, limit=100)
+    return web.json_response([vacancy_to_dict(r) for r in rows])
 
 
 def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_payment=None) -> web.Application:
@@ -133,7 +117,6 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             amount = (session.get("amount_total") or 0) / 100  # центы → доллары
             currency = (session.get("currency") or "usd").upper()
             charge_id = session.get("payment_intent") or session.get("id")
-            customer_id = session.get("customer")
 
             if ref.startswith("digest_") and on_stripe_digest_payment:
                 tg_id_raw = ref.replace("digest_", "", 1)
@@ -143,70 +126,14 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
                         await on_stripe_digest_payment(bot, tg_id, amount, currency, charge_id)
                     except Exception as e:
                         print(f"[stripe webhook] Ошибка доставки дайджеста для tg_id={tg_id}: {e}")
-                else:
-                    await _notify_admin_unmatched_payment(bot, "digest", ref, amount, currency, charge_id)
             elif ref.isdigit() and on_stripe_payment:
                 tg_id = int(ref)
-                if customer_id:
-                    # сохраняем привязку customer_id → tg_id: без неё следующие
-                    # ежемесячные списания (invoice.payment_succeeded) не смогут
-                    # понять, кому именно продлевать доступ — Stripe не передаёт
-                    # client_reference_id в повторных счетах, только в первом
-                    # checkout.session
-                    db.set_stripe_customer_id(tg_id, customer_id)
                 try:
                     await on_stripe_payment(bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
                 except Exception as e:
                     print(f"[stripe webhook] Ошибка обработки оплаты для tg_id={tg_id}: {e}")
-            else:
-                # платёж пришёл, но мы не понимаем, кому его доставить — скорее
-                # всего, человек оплатил по "голой" ссылке из Stripe Dashboard
-                # напрямую, а не по ссылке из бота (та добавляет
-                # ?client_reference_id=... автоматически). Доставить нужно
-                # будет вручную — админ узнаёт об этом сразу, а не от клиента
-                await _notify_admin_unmatched_payment(bot, "unknown", ref, amount, currency, charge_id)
-
-        elif event["type"] == "invoice.payment_succeeded":
-            invoice = event["data"]["object"]
-            # billing_reason == "subscription_create" — это самый первый счёт,
-            # он уже обработан выше через checkout.session.completed; здесь нас
-            # интересуют именно повторные ежемесячные списания
-            if invoice.get("billing_reason") == "subscription_cycle" and on_stripe_payment:
-                customer_id = invoice.get("customer")
-                tg_id = db.get_tg_id_by_stripe_customer(customer_id) if customer_id else None
-                if tg_id:
-                    amount = (invoice.get("amount_paid") or 0) / 100
-                    currency = (invoice.get("currency") or "usd").upper()
-                    charge_id = invoice.get("payment_intent") or invoice.get("id")
-                    try:
-                        await on_stripe_payment(bot, tg_id, STRIPE_SUBSCRIPTION_DAYS, amount, currency, charge_id)
-                    except Exception as e:
-                        print(f"[stripe webhook] Ошибка продления подписки для tg_id={tg_id}: {e}")
-                else:
-                    print(f"[stripe webhook] Не нашёл tg_id для customer_id={customer_id} — "
-                          f"возможно, первый платёж прошёл до того, как появилась привязка customer_id")
 
         return web.Response(status=200, text="ok")
-
-    async def handle_vacancies(request: web.Request) -> web.Response:
-        # раньше этот эндпоинт был открыт без всякой проверки и отдавал
-        # contact (email рекрутера) всем подряд — через /api/vacancies?limit=100
-        # можно было бесплатно выкачать все контакты, которые как раз и
-        # продаются платным дайджестом. Теперь contact виден только тем, кто
-        # реально платил — та же логика, что и в самом боте (hide_contact)
-        region = request.query.get("region", "").strip()
-        q = request.query.get("q", "").strip()
-        init_data = request.query.get("initData", "")
-        tg_id = get_authenticated_tg_id(init_data)
-        hide_contact = tg_id is None or db.count_payments(tg_id) == 0
-        rows = db.search_published_vacancies(region=region, q=q, limit=100)
-        out = []
-        for r in rows:
-            d = vacancy_to_dict(r)
-            if hide_contact:
-                d["contact"] = None
-            out.append(d)
-        return web.json_response(out)
 
     async def handle_get_profile(request: web.Request) -> web.Response:
         init_data = request.query.get("initData", "")
@@ -223,28 +150,14 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             "vessel_types": row["vessel_types"],
             "years_experience": row["years_experience"],
             "availability": row["availability"],
-            # resume_data (сам файл) никогда не отдаём обратно в мини-приложение —
-            # только имя файла, чтобы показать "резюме загружено: cv.pdf"
-            "resume_filename": row["resume_filename"] if "resume_filename" in row.keys() else None,
+            "documents": row["documents"],
         })
 
     async def handle_post_profile(request: web.Request) -> web.Response:
-        resume_filename, resume_data = None, None
-        if request.content_type == "multipart/form-data":
-            body = {}
-            reader = await request.multipart()
-            async for part in reader:
-                if part.name == "resume" and part.filename:
-                    data = await part.read(decode=True)
-                    if data and len(data) <= 10 * 1024 * 1024:
-                        resume_filename, resume_data = part.filename[:200], data
-                else:
-                    body[part.name] = (await part.text()).strip()
-        else:
-            try:
-                body = await request.json()
-            except json.JSONDecodeError:
-                return web.json_response({"error": "invalid_json"}, status=400)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
         tg_id = get_authenticated_tg_id(body.get("initData", ""))
         if tg_id is None:
             return web.json_response({"error": "invalid_init_data"}, status=403)
@@ -255,11 +168,8 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
             "vessel_types": (body.get("vessel_types") or "").strip()[:300],
             "years_experience": (body.get("years_experience") or "").strip()[:20],
             "availability": (body.get("availability") or "").strip()[:50],
-            "documents": "",  # поле заменено загрузкой резюме, текстом больше не используется
+            "documents": (body.get("documents") or "").strip()[:300],
         }
-        if resume_data:
-            fields["resume_filename"] = resume_filename
-            fields["resume_data"] = resume_data
         db.upsert_candidate_profile(tg_id, fields)
         return web.json_response({"ok": True})
 
@@ -280,25 +190,10 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         ])
 
     async def handle_apply(request: web.Request) -> web.Response:
-        # multipart — чтобы вместе с полями формы можно было прислать и файл
-        # резюме одним запросом (обычный JSON этого не умеет)
-        resume_filename, resume_data = None, None
-        if request.content_type == "multipart/form-data":
-            fields = {}
-            reader = await request.multipart()
-            async for part in reader:
-                if part.name == "resume" and part.filename:
-                    data = await part.read(decode=True)
-                    if data and len(data) <= 10 * 1024 * 1024:  # 10 МБ с запасом
-                        resume_filename, resume_data = part.filename[:200], data
-                else:
-                    fields[part.name] = (await part.text()).strip()
-            body = fields
-        else:
-            try:
-                body = await request.json()
-            except json.JSONDecodeError:
-                return web.json_response({"error": "invalid_json"}, status=400)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "invalid_json"}, status=400)
 
         init_data = body.get("initData", "")
         parsed = validate_init_data(init_data, bot_token)
@@ -310,48 +205,28 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
         except json.JSONDecodeError:
             tg_user = {}
 
-        try:
-            vacancy_id = int(body.get("vacancy_id"))
-        except (TypeError, ValueError):
-            return web.json_response({"error": "invalid_vacancy_id"}, status=400)
-        # ограничиваем длину полей — initData подтверждает, что это реальный
-        # пользователь Telegram, но без этого он всё равно мог прислать
-        # сколько угодно текста в одном запросе
-        contact = (body.get("contact") or "").strip()[:300]
-        message = (body.get("message") or "").strip()[:1000]
-        name = (body.get("name") or tg_user.get("first_name") or "").strip()[:200]
-        rank = (body.get("rank") or "").strip()[:50]
+        vacancy_id = body.get("vacancy_id")
+        contact = (body.get("contact") or "").strip()
+        message = (body.get("message") or "").strip()
+        name = (body.get("name") or tg_user.get("first_name") or "").strip()
 
-        if not contact:
+        if not vacancy_id or not contact:
             return web.json_response({"error": "missing_fields"}, status=400)
-        if not db.get_vacancy(vacancy_id):
-            return web.json_response({"error": "vacancy_not_found"}, status=404)
-        # один и тот же человек не должен засыпать админов повторными
-        # откликами на одну и ту же вакансию — initData не спасает от
-        # многократных НАСТОЯЩИХ запросов одного пользователя подряд
-        if db.has_recent_application(tg_user.get("id"), vacancy_id):
-            return web.json_response({"error": "duplicate_application"}, status=429)
 
         db.insert_application(
-            vacancy_id=vacancy_id,
+            vacancy_id=int(vacancy_id),
             candidate_tg_id=tg_user.get("id"),
             candidate_name=name,
             candidate_username=tg_user.get("username"),
             contact=contact,
             message=message,
-            candidate_rank=rank or None,
-            resume_filename=resume_filename,
-            resume_data=resume_data,
         )
 
-        vacancy = db.get_vacancy(vacancy_id)
+        vacancy = db.get_vacancy(int(vacancy_id))
         position = vacancy["position"] if vacancy else "вакансия"
         admin_ids = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}"]
-        if rank:
-            notify_lines.append(f"Звание: {rank}")
-        notify_lines.append(f"Контакт: {contact}")
+        notify_lines = [f"📥 Новый отклик на «{position}»", "", f"Имя: {name or '—'}", f"Контакт: {contact}"]
         if tg_user.get("username"):
             notify_lines.append(f"Telegram: @{tg_user['username']}")
         if message:
@@ -360,14 +235,7 @@ def create_app(bot, bot_token: str, on_stripe_payment=None, on_stripe_digest_pay
 
         for admin_id in admin_ids:
             try:
-                if resume_data:
-                    await bot.send_document(
-                        chat_id=admin_id,
-                        document=BufferedInputFile(resume_data, filename=resume_filename or "resume"),
-                        caption=notify_text,
-                    )
-                else:
-                    await bot.send_message(chat_id=admin_id, text=notify_text)
+                await bot.send_message(chat_id=admin_id, text=notify_text)
             except Exception:
                 pass
 
